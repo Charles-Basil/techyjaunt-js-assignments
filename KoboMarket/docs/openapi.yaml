@@ -16,6 +16,11 @@ tags:
   - name: System
   - name: Auth
   - name: Users
+  - name: Vendors
+  - name: Admin
+  - name: Products
+  - name: Reviews
+  - name: Cart
   - name: RBAC test
 
 paths:
@@ -314,6 +319,475 @@ paths:
         '400': { $ref: '#/components/responses/ValidationError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/v1/vendors/apply:
+    post:
+      summary: Apply to become a vendor
+      description: |
+        One application per user. 409 if you already have a PENDING or APPROVED one.
+        After a REJECTED decision you may apply again. Frozen accounts get 403.
+        The account number is always masked in responses.
+      tags: [Vendors]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorApplyRequest' }
+            example:
+              storeName: Ada Shoes
+              description: Handmade leather shoes
+              bankDetails: { bankName: GTBank, bankCode: '058', accountNumber: '0123456789', accountName: Ada Obi }
+      responses:
+        '201':
+          description: Application submitted (status PENDING)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorApplicationResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Account frozen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: APPLICATION_EXISTS or STORE_NAME_TAKEN
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: APPLICATION_EXISTS, message: You already have a PENDING vendor application, details: null }
+
+  /api/v1/vendors/{id}:
+    get:
+      summary: Public store info for an approved vendor
+      description: "`id` is the vendor's user id (the same value as `vendorId` on products). No bank details."
+      tags: [Vendors]
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: Store info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      vendor: { $ref: '#/components/schemas/PublicVendor' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/vendors:
+    get:
+      summary: List vendor applications (ADMIN)
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING, APPROVED, REJECTED] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of applications, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VendorApplication' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/vendors/{id}/approve:
+    patch:
+      summary: Approve or reject a vendor application (ADMIN)
+      description: |
+        `id` is the application id. Only PENDING applications can be decided.
+        APPROVED adds the VENDOR role to the user. A reason is required when rejecting.
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [APPROVED, REJECTED] }
+                reason: { type: string, maxLength: 500 }
+            examples:
+              approve: { value: { decision: APPROVED } }
+              reject: { value: { decision: REJECTED, reason: Bank account name does not match } }
+      responses:
+        '200':
+          description: Decision saved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorApplicationResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already decided
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: APPLICATION_ALREADY_DECIDED, message: Application is already APPROVED, details: null }
+
+  /api/v1/products:
+    get:
+      summary: List and search products (public, cursor paginated)
+      description: |
+        Only active, non-deleted products. Pass `pagination.nextCursor` back as `cursor`
+        (with the same filters and sort) to get the next page. Price filters use the base price.
+      tags: [Products]
+      parameters:
+        - { in: query, name: q, schema: { type: string }, description: Full-text search on name and description }
+        - { in: query, name: category, schema: { type: string } }
+        - { in: query, name: vendorId, schema: { type: string } }
+        - { in: query, name: minPrice, schema: { type: integer, minimum: 0 }, description: In kobo }
+        - { in: query, name: maxPrice, schema: { type: integer, minimum: 0 }, description: In kobo }
+        - { in: query, name: minRating, schema: { type: number, minimum: 0, maximum: 5 } }
+        - in: query
+          name: sort
+          schema: { type: string, enum: [newest, price_asc, price_desc, rating], default: newest }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of products
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400':
+          description: Bad query value (VALIDATION_ERROR) or bad cursor (INVALID_CURSOR)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    post:
+      summary: Create a product (VENDOR with an APPROVED profile)
+      tags: [Products]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductCreateRequest' }
+            example:
+              name: Leather Boot
+              description: Handmade
+              priceKobo: 2500000
+              category: shoes
+              stock: 0
+              images: ['https://example.com/boot.jpg']
+              tags: [leather]
+              variants:
+                - { name: Size 42, sku: BOOT-42, attributes: { size: '42', colour: brown }, priceKobo: 2500000, stock: 4 }
+      responses:
+        '201':
+          description: Product created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not a vendor (FORBIDDEN) or profile not approved (VENDOR_NOT_APPROVED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/products/{slug}:
+    get:
+      summary: Get one product by slug (public)
+      tags: [Products]
+      parameters:
+        - { in: path, name: slug, required: true, schema: { type: string }, example: leather-boot-4f9a1c }
+      responses:
+        '200':
+          description: The product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductResponse' }
+        '404':
+          description: Not found, deleted or inactive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/products/{id}:
+    patch:
+      summary: Update your own product (VENDOR, owner only)
+      description: vendorId, slug, ratingAvg, ratingCount and isDeleted cannot be changed (400).
+      tags: [Products]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductUpdateRequest' }
+            example:
+              priceKobo: 2200000
+              stock: 7
+      responses:
+        '200':
+          description: Updated product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not a vendor (FORBIDDEN) or not your product (NOT_PRODUCT_OWNER)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      summary: Soft-delete your own product (VENDOR, owner only)
+      description: Sets isDeleted true, isActive false and deletedAt. The product disappears from listings.
+      tags: [Products]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/products/{id}/reviews:
+    get:
+      summary: List a product's reviews (public, newest first, cursor paginated)
+      tags: [Reviews]
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of reviews
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Review' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      summary: Review a product you have received
+      description: Requires a COMPLETED sub-order containing this product. One review per buyer per product.
+      tags: [Reviews]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 2000 }
+            example:
+              rating: 5
+              comment: Fits perfectly
+      responses:
+        '201':
+          description: Review created; the product's ratingAvg and ratingCount are updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      review: { $ref: '#/components/schemas/Review' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: No completed purchase of this product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: NOT_ELIGIBLE_TO_REVIEW, message: You can only review products you have received, details: null }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already reviewed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: ALREADY_REVIEWED, message: You have already reviewed this product, details: null }
+
+  /api/v1/cart:
+    get:
+      summary: Get your cart with CURRENT prices and stock
+      description: |
+        Each item has flags: `priceChanged` (current price differs from when you added it),
+        `outOfStock` (current stock is below your quantity) and `unavailable` (product deleted,
+        hidden, or variant removed). `subtotalKobo` uses current prices; unavailable items count as 0.
+      tags: [Cart]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Your cart
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/cart/items:
+    post:
+      summary: Add a product to your cart
+      description: |
+        If the same product + variant is already in the cart, the quantities are added together.
+        The total may not exceed current stock (409 INSUFFICIENT_STOCK) or 100.
+        Products that have variants require `variantId` (400 VARIANT_REQUIRED).
+      tags: [Cart]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              properties:
+                productId: { type: string }
+                variantId: { type: string }
+                quantity: { type: integer, minimum: 1, maximum: 100 }
+            example:
+              productId: 674a1f0c2b9e4c0012ab34cd
+              quantity: 2
+      responses:
+        '201':
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: PRODUCT_UNAVAILABLE or VARIANT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Not enough stock (INSUFFICIENT_STOCK) or the cart changed meanwhile (CART_CONFLICT)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: INSUFFICIENT_STOCK, message: Not enough stock for this quantity, details: { available: 5, requested: 6 } }
+
+  /api/v1/cart/items/{itemId}:
+    patch:
+      summary: Change the quantity of a cart item
+      tags: [Cart]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: itemId, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: integer, minimum: 1, maximum: 100 }
+            example:
+              quantity: 3
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: CART_ITEM_NOT_FOUND or PRODUCT_UNAVAILABLE
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: Not enough stock
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+    delete:
+      summary: Remove an item from your cart
+      tags: [Cart]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: itemId, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CartResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: CART_ITEM_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /api/v1/admin/ping:
     get:
       summary: RBAC test route (ADMIN only)
@@ -357,7 +831,31 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+  parameters:
+    IdPath:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, pattern: '^[0-9a-fA-F]{24}$' }
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    Cursor:
+      in: query
+      name: cursor
+      description: The `nextCursor` value from the previous page
+      schema: { type: string }
+
   responses:
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            error: { code: NOT_FOUND, message: Product not found, details: null }
     ValidationError:
       description: Request body failed validation
       content:
@@ -459,6 +957,199 @@ components:
           refreshToken: 5e0c...b7f2
           tokenType: Bearer
           expiresIn: 15m
+
+    Pagination:
+      type: object
+      properties:
+        nextCursor: { type: string, nullable: true, description: Send back as ?cursor= for the next page }
+        hasMore: { type: boolean }
+        limit: { type: integer }
+      example:
+        nextCursor: eyJzb3J0VmFsdWUiOjE1MDAwMDAsIl9pZCI6IjY3NGExZjBjMmI5ZTRjMDAxMmFiMzRjZCJ9
+        hasMore: true
+        limit: 20
+
+    BankDetails:
+      type: object
+      required: [bankName, bankCode, accountNumber, accountName]
+      properties:
+        bankName: { type: string }
+        bankCode: { type: string, pattern: '^\d{3,6}$' }
+        accountNumber: { type: string, description: '10 digits. Responses show only the last 4, e.g. ******6789' }
+        accountName: { type: string }
+
+    VendorApplyRequest:
+      type: object
+      additionalProperties: false
+      required: [storeName, bankDetails]
+      properties:
+        storeName: { type: string, minLength: 2, maxLength: 60 }
+        description: { type: string, maxLength: 1000 }
+        bankDetails: { $ref: '#/components/schemas/BankDetails' }
+
+    VendorApplication:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        storeName: { type: string }
+        storeSlug: { type: string }
+        description: { type: string }
+        bankDetails: { $ref: '#/components/schemas/BankDetails' }
+        status: { type: string, enum: [PENDING, APPROVED, REJECTED] }
+        rejectionReason: { type: string, nullable: true }
+        reviewedBy: { type: string, nullable: true }
+        reviewedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    VendorApplicationResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            application: { $ref: '#/components/schemas/VendorApplication' }
+
+    PublicVendor:
+      type: object
+      properties:
+        vendorId: { type: string }
+        storeName: { type: string }
+        storeSlug: { type: string }
+        description: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    Variant:
+      type: object
+      required: [name, sku, priceKobo, stock]
+      properties:
+        _id: { type: string, description: 'Send the existing _id on update to keep the variant (carts point at it)' }
+        name: { type: string }
+        sku: { type: string }
+        attributes:
+          type: object
+          properties:
+            size: { type: string }
+            colour: { type: string }
+        priceKobo: { type: integer, minimum: 1 }
+        stock: { type: integer, minimum: 0 }
+
+    ProductCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, priceKobo, category, stock]
+      properties:
+        name: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 5000 }
+        priceKobo: { type: integer, minimum: 1, maximum: 10000000000, description: Whole kobo }
+        category: { type: string, description: Stored in lowercase }
+        images: { type: array, maxItems: 10, items: { type: string, format: uri } }
+        stock: { type: integer, minimum: 0 }
+        variants: { type: array, maxItems: 50, items: { $ref: '#/components/schemas/Variant' } }
+        tags: { type: array, maxItems: 20, items: { type: string } }
+
+    ProductUpdateRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string }
+        description: { type: string }
+        priceKobo: { type: integer, minimum: 1 }
+        category: { type: string }
+        images: { type: array, items: { type: string, format: uri } }
+        stock: { type: integer, minimum: 0 }
+        variants: { type: array, items: { $ref: '#/components/schemas/Variant' } }
+        tags: { type: array, items: { type: string } }
+        isActive: { type: boolean }
+
+    Product:
+      type: object
+      properties:
+        id: { type: string }
+        vendorId: { type: string, description: "The vendor's user id" }
+        name: { type: string }
+        slug: { type: string }
+        description: { type: string }
+        priceKobo: { type: integer }
+        category: { type: string }
+        images: { type: array, items: { type: string } }
+        stock: { type: integer }
+        variants: { type: array, items: { $ref: '#/components/schemas/Variant' } }
+        tags: { type: array, items: { type: string } }
+        isActive: { type: boolean }
+        ratingAvg: { type: number, example: 4.33 }
+        ratingCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    ProductResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            product: { $ref: '#/components/schemas/Product' }
+
+    Review:
+      type: object
+      properties:
+        id: { type: string }
+        productId: { type: string }
+        buyerId: { type: string }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    CartItem:
+      type: object
+      properties:
+        id: { type: string, description: Use as itemId in PATCH/DELETE }
+        productId: { type: string }
+        variantId: { type: string, nullable: true }
+        vendorId: { type: string }
+        name: { type: string }
+        quantity: { type: integer }
+        priceKoboSnapshot: { type: integer, description: Price when added (display only) }
+        currentPriceKobo: { type: integer, nullable: true }
+        currentStock: { type: integer }
+        lineTotalKobo: { type: integer }
+        priceChanged: { type: boolean }
+        outOfStock: { type: boolean }
+        unavailable: { type: boolean }
+        addedAt: { type: string, format: date-time }
+
+    CartResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            items: { type: array, items: { $ref: '#/components/schemas/CartItem' } }
+            subtotalKobo: { type: integer }
+      example:
+        success: true
+        data:
+          items:
+            - id: 674a20aa2b9e4c0012ab3501
+              productId: 674a1f0c2b9e4c0012ab34cd
+              variantId: null
+              vendorId: 674a1e992b9e4c0012ab34aa
+              name: Red Sneakers
+              quantity: 2
+              priceKoboSnapshot: 250000
+              currentPriceKobo: 300000
+              currentStock: 5
+              lineTotalKobo: 600000
+              priceChanged: true
+              outOfStock: false
+              unavailable: false
+              addedAt: '2026-11-21T10:00:00.000Z'
+          subtotalKobo: 600000
 
     MessageResponse:
       type: object

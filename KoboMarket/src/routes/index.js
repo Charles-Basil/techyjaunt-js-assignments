@@ -9,7 +9,10 @@ router.get('/', (req, res) => {
 
 router.use('/auth', require('../modules/auth/auth.routes'));
 router.use('/users', require('../modules/users/users.routes'));
+router.use('/vendors', require('../modules/vendors/vendors.routes'));
+router.use('/products', require('../modules/products/products.routes'));
+router.use('/cart', require('../modules/cart/cart.routes'));
 router.use('/admin', require('../modules/admin/admin.routes'));
-router.use('/vendor', require('../modules/vendors/vendor.routes'));
+router.use('/vendor', require('../modules/vendors/vendorPing.routes')); // RBAC test route only
 
 module.exports = router;

@@ -55,6 +55,11 @@ function resetPasswordByTokenHash(tokenHash, now, passwordHash) {
   );
 }
 
+// $addToSet adds the role only if the user doesn't already have it.
+function addRole(id, role) {
+  return User.updateOne({ _id: id }, { $addToSet: { roles: role } });
+}
+
 function markWalletCreated(id) {
   return User.updateOne({ _id: id }, { $set: { walletStatus: 'CREATED' } });
 }
@@ -76,6 +81,7 @@ module.exports = {
   verifyEmailByTokenHash,
   setPasswordResetToken,
   resetPasswordByTokenHash,
+  addRole,
   markWalletCreated,
   findPendingWallets,
 };

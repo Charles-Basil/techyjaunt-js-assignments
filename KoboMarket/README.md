@@ -56,7 +56,7 @@ npm test
 
 - `tests/globalSetup.js` refuses to run unless both database names end in `_test`,
   creates the `kobomarket_test` Postgres database if needed, and runs all migrations.
-- Each test file wipes users, refresh tokens and user wallets before every test.
+- Before every test, all Mongo collections, the Postgres order tables and user wallets are wiped (system accounts stay).
 - Tests read verification/reset tokens by spying on the mailer (`jest.spyOn`), not from logs.
 
 ## Auth overview
@@ -76,6 +76,34 @@ npm test
 - **Login rate limit**: 5 failed attempts per 15 minutes per `email:ip`. Successful logins don't count.
 - **Emails** are not really sent: the dev mailer logs the link. Find it with
   `docker compose logs api`, then search the output for "EMAIL (dev mailer)".
+
+## Marketplace: vendors, products, reviews, cart
+
+- **Becoming a vendor**: `POST /vendors/apply` (PENDING), then an admin calls
+  `PATCH /admin/vendors/:applicationId/approve`. APPROVED adds the `VENDOR` role
+  (`$addToSet`). Only APPROVED vendors can create products. Bank account numbers
+  are masked (`******6789`) in every response.
+- **Two different ids**: `/vendors/:id` takes the vendor's **user id** (the same
+  value as `product.vendorId`). Admin routes take the **application id**.
+- **Products** are soft-deleted (`isDeleted`, `deletedAt`), so they vanish from
+  shoppers but old orders still point at them. Ownership ("is this MY product?")
+  is checked in the service. Roles are checked only in `requireRole` middleware.
+- **Cursor pagination** (`src/utils/pagination.js`): the cursor is base64 JSON of
+  `{ sortValue, _id }` of the last item. The next page asks for "after that point":
+  `{ $or: [ { price: { $gt: v } }, { price: v, _id: { $gt: id } } ] }` sorted by
+  `{ price: 1, _id: 1 }`. `_id` breaks ties, so items with equal prices are never
+  skipped or repeated. We fetch `limit + 1` items to know if there is another page.
+  Unlike `skip()`, this stays fast on page 1,000.
+- **Reviews** need a COMPLETED sub-order for that product (a Postgres join across
+  `order_items`, `sub_orders` and `orders`). The rating average is updated inside
+  MongoDB with one pipeline update, so two simultaneous reviews can't overwrite
+  each other.
+- **Cart** stores price and name *snapshots* for display only. `GET /cart` and
+  `cartService.validateForCheckout()` always re-read the current price and stock.
+  Each item is flagged `priceChanged`, `outOfStock` or `unavailable`. Products with
+  variants must be added with a `variantId`. Concurrent edits to the same cart
+  return `409 CART_CONFLICT` instead of losing one of the changes (Mongoose
+  `optimisticConcurrency`).
 
 ## Cross-database consistency: user -> wallet
 
@@ -124,9 +152,9 @@ src/
   config/             env (zod-validated), logger (pino), mongo, knex
   middlewares/        requestId, errorHandler, notFound, validate, auth, rbac, notFrozen, idempotency*
   routes/             /health and the /api/v1 router
-  utils/AppError.js   Errors we throw on purpose
   modules/            One folder per feature (routes -> controllers -> services -> repositories)
   jobs/               Background jobs (walletReconciler.job.js)
+  utils/              AppError, cursor pagination, slugs, tokens, shared zod schemas
   ledger/ events/ mock-paystack/
 db/migrations/        Knex migrations (Postgres)
 db/seeds/             Knex seeds
