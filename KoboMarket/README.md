@@ -105,6 +105,148 @@ npm test
   return `409 CART_CONFLICT` instead of losing one of the changes (Mongoose
   `optimisticConcurrency`).
 
+## Double-entry ledger
+
+All money lives in PostgreSQL as **BIGINT kobo**. In JavaScript, money maths uses
+**BigInt** (`1500n + 250n`). Postgres returns BIGINT as a string, so it is converted
+with `BigInt(value)`. Responses use plain JSON numbers via `toKoboNumber()`, which
+throws rather than return a rounded number above `Number.MAX_SAFE_INTEGER`.
+
+**Accounts** (`accounts` table): one NGN wallet per user, plus system accounts:
+
+| Code | What it holds |
+| --- | --- |
+| `PLATFORM_ESCROW` | Buyer money held until an order completes |
+| `PLATFORM_REVENUE` | Commission the platform earned |
+| `PLATFORM_PAYOUT_CLEARING` | Vendor money on its way to a bank |
+| `PLATFORM_EXTERNAL_SETTLEMENT` | The outside world (Paystack, banks). May go negative |
+
+**Sign convention, the same for every account:**
+
+```
+balance_kobo = SUM(credits) - SUM(debits)
+```
+
+A CREDIT adds to a balance and a DEBIT takes from it. Every transaction's debits equal
+its credits, so **the sum of all balances is always exactly 0**.
+
+**The external settlement account** is how money enters and leaves the system:
+
+| Event | DEBIT | CREDIT |
+| --- | --- | --- |
+| Wallet funding | `PLATFORM_EXTERNAL_SETTLEMENT` | user wallet |
+| Payout settled (later block) | `PLATFORM_PAYOUT_CLEARING` | `PLATFORM_EXTERNAL_SETTLEMENT` |
+
+After NGN 2,500 is funded, the wallet is `+250000` and external is `-250000`.
+"External is negative 250000" reads as "250000 kobo came in from outside".
+
+**Money identity** (checked by the audit):
+
+```
+user wallets + escrow + revenue + payout clearing  =  total funded - total paid out
+                                                    =  -(external balance)
+```
+
+**Rules enforced in code and in the database:**
+
+- `src/ledger/ledger.service.js` is the **only** code that inserts `ledger_entries`
+  or changes `balance_kobo`. Its `postTransaction(trx, ...)`:
+  1. refuses to run outside a Knex transaction;
+  2. validates *before writing anything*: at least 2 entries, every amount a
+     positive BigInt, and debits = credits (otherwise `LEDGER_UNBALANCED`, a 500,
+     because it is a bug in our code);
+  3. locks every account row with `SELECT ... FOR UPDATE ORDER BY id`. A fixed lock
+     order means two transfers between the same accounts can never deadlock;
+  4. inserts the transaction, its entries, and one `UPDATE balance = balance + change`
+     per account (the arithmetic happens in Postgres);
+  5. runs inside a **savepoint**, so a failure leaves nothing behind and the caller's
+     outer transaction is still usable.
+- A user wallet can't go negative: `CHECK (owner_type = 'SYSTEM' OR balance_kobo >= 0)`.
+  The ledger turns that error (23514) into `402 INSUFFICIENT_FUNDS`. Because the check
+  is in the database, it holds even when two debits race each other (there's a test).
+- `ledger_entries` (and `webhook_events`) are **append-only**: a trigger rejects
+  UPDATE and DELETE. Mistakes are fixed with a new, reversing transaction.
+- A reused transaction `reference` or `idempotency_key` gives `409 DUPLICATE_TRANSACTION`.
+
+**Ledger audit:** `npm run audit:ledger` (dev database) or
+`$env:NODE_ENV='test'; npm run audit:ledger` (test database). Each check is one SQL aggregate:
+
+1. every transaction balances (and has at least 2 entries);
+2. every stored balance = credits - debits of that account's entries;
+3. the sum of all balances = 0;
+4. the money identity above.
+
+It prints PASS/FAIL per check and exits with code 1 on failure.
+
+## Wallet funding and webhook idempotency
+
+```
+POST /wallet/fund ──> wallet_fundings row PENDING ──> Paystack payment page
+                                                          │ buyer pays
+Paystack ──> POST /webhooks/paystack (charge.success, maybe several times)
+```
+
+1. **Signature first.** `x-paystack-signature` must equal HMAC-SHA512 (hex) of the
+   **raw** request bytes (`express.json({ verify })` keeps them in `req.rawBody`),
+   compared with `crypto.timingSafeEqual`. Missing or wrong: `401 INVALID_SIGNATURE`,
+   recorded, nothing processed.
+2. **Never trust the webhook body.** We call Paystack's verify API and require
+   status `success`, currency `NGN` and **amount equal to the funding's amount_kobo**.
+   If not, nothing is credited and the reason is recorded. The funding becomes
+   FAILED only if Paystack itself says the payment failed. If Paystack can't be
+   reached, we answer 500 so Paystack retries later.
+3. **Credit in one Postgres transaction**: lock the funding row, check it isn't
+   SUCCESS yet, post DEBIT external / CREDIT wallet, set the funding to SUCCESS.
+4. Every webhook is written to `webhook_events` (append-only) with its result:
+   `CREDITED`, `ALREADY_PROCESSED`, `VERIFY_FAILED`, `UNKNOWN_REFERENCE`,
+   `MARKED_FAILED`, `IGNORED` or `INVALID_SIGNATURE`.
+5. Every validly signed event gets `200 { received: true }`, so Paystack stops retrying.
+
+**Why a payment is credited exactly once**, even if Paystack sends the webhook 3
+times or 2 copies arrive at the same moment:
+
+| Layer | What it stops |
+| --- | --- |
+| `SELECT ... FOR UPDATE` on the funding row | Two copies at the same time: the second **waits** until the first commits |
+| `status = 'SUCCESS'` check after taking the lock | The waiting copy (and any later copy) sees SUCCESS and does nothing |
+| `UNIQUE (idempotency_key)` = `paystack:<reference>` on `transactions` | Last line of defence: even buggy code can't post the same payment twice |
+
+The tests send duplicates one after another and at the same time with
+`Promise.all`. With the guards removed on purpose, those tests fail.
+
+Funding a **frozen** wallet is still recorded (`allowFrozen`): the money really
+arrived at Paystack, so the books must show it. Freezing blocks spending, not
+recording a payment the user made.
+
+**Mock Paystack** (`PAYSTACK_MODE=mock`, default; never mounted in production):
+`authorizationUrl` points at `GET /mock-paystack/checkout/:reference`.
+`POST /mock-paystack/checkout/:reference/pay { outcome, duplicates }` marks the
+payment and sends `duplicates` real signed webhooks to `WEBHOOK_TARGET_URL`.
+Set `PAYSTACK_MODE=live` with a Paystack **test** secret key to use the real API.
+
+## Idempotency-Key
+
+Money endpoints (`POST /wallet/fund` now, checkout and payouts later) require an
+`Idempotency-Key` header (8-100 characters of `A-Z a-z 0-9 _ -`). Generate one per
+user action and reuse it **only** to retry that same action.
+
+| Situation | Result |
+| --- | --- |
+| First request | Runs. The status and body are stored **before** the response is sent |
+| Same key + same body again | Stored response replayed, header `Idempotent-Replayed: true`. The handler does **not** run again |
+| Same key + different body | `409 IDEMPOTENCY_KEY_REUSED` |
+| Same key while the first request is still running | `409 REQUEST_IN_PROGRESS` |
+| First request ended in a 5xx | Row deleted: a retry with the same key runs again |
+| No header | `400 IDEMPOTENCY_KEY_REQUIRED` |
+
+- 4xx answers are stored too (same key + same body = same answer).
+- Keys are scoped per user **and** per endpoint (`POST /api/v1/wallet/fund`).
+- "Request hash" = sha256 of the body as JSON with sorted keys, so key order doesn't matter.
+- `INSERT ... ON CONFLICT DO NOTHING` decides atomically which of two simultaneous
+  identical requests runs.
+- Known limit: if the server crashes mid-request, that key stays "in progress"
+  (409) until the row is removed. A cleanup job for old in-progress rows can come later.
+
 ## Cross-database consistency: user -> wallet
 
 Users live in **MongoDB** and wallets (the `accounts` table) live in **PostgreSQL**.
@@ -141,7 +283,7 @@ duplicate or missing wallet.
 | `npm run migrate:rollback` | Undo the last batch of migrations             |
 | `npm run seed`             | Run seed files (placeholder for now)          |
 | `npm test`                 | Run Jest tests                                |
-| `npm run audit:ledger`     | Ledger consistency check (placeholder for now)|
+| `npm run audit:ledger`     | Ledger consistency audit (exit code 1 on FAIL) |
 
 ## Project structure
 
@@ -150,12 +292,15 @@ src/
   app.js              Express app (middleware, routes, error handling)
   server.js           Connects DBs, starts HTTP, graceful shutdown
   config/             env (zod-validated), logger (pino), mongo, knex
-  middlewares/        requestId, errorHandler, notFound, validate, auth, rbac, notFrozen, idempotency*
+  middlewares/        requestId, errorHandler, notFound, validate, auth, rbac, notFrozen, idempotency
   routes/             /health and the /api/v1 router
   modules/            One folder per feature (routes -> controllers -> services -> repositories)
   jobs/               Background jobs (walletReconciler.job.js)
   utils/              AppError, cursor pagination, slugs, tokens, shared zod schemas
-  ledger/ events/ mock-paystack/
+  ledger/             ledger.service.js (the only code that moves money), audit.js
+  integrations/       paystack.client.js (mock or live provider)
+  mock-paystack/      Fake Paystack: provider, checkout routes, signed webhook sender
+  events/             (later blocks)
 db/migrations/        Knex migrations (Postgres)
 db/seeds/             Knex seeds
 docs/openapi.yaml     API documentation served at /api-docs
@@ -163,7 +308,6 @@ scripts/              CLI scripts (ledger audit)
 tests/                Jest + supertest
 ```
 
-`*` = idempotency is still a stub (passes requests through).
 
 ## Error format
 

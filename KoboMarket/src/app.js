@@ -17,6 +17,7 @@ const errorHandler = require('./middlewares/errorHandler');
 const AppError = require('./utils/AppError');
 const healthRouter = require('./routes/health');
 const apiRouter = require('./routes');
+const webhookRouter = require('./modules/wallet/webhook.routes');
 
 const app = express();
 
@@ -46,10 +47,25 @@ app.use(
   })
 );
 app.use(cors({ origin: env.CORS_ORIGINS }));
-app.use(express.json({ limit: '1mb' }));
+app.use(
+  express.json({
+    limit: '1mb',
+    // Keep the exact bytes of the body: webhook signatures are computed over
+    // the raw bytes, and re-serialising req.body could change them.
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // 3. Routes
 app.use('/health', healthRouter);
+// Webhooks are mounted BEFORE the API rate limiter: Paystack must never be throttled.
+app.use('/api/v1/webhooks', webhookRouter);
+// The fake Paystack only exists in mock mode, and never in production.
+if (env.PAYSTACK_MODE === 'mock' && env.NODE_ENV !== 'production') {
+  app.use('/mock-paystack', require('./mock-paystack/mock.routes'));
+}
 
 const swaggerDoc = YAML.load(path.join(__dirname, '..', 'docs', 'openapi.yaml'));
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDoc));

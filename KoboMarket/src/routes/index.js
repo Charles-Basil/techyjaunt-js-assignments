@@ -14,5 +14,6 @@ router.use('/products', require('../modules/products/products.routes'));
 router.use('/cart', require('../modules/cart/cart.routes'));
 router.use('/admin', require('../modules/admin/admin.routes'));
 router.use('/vendor', require('../modules/vendors/vendorPing.routes')); // RBAC test route only
+router.use('/wallet', require('../modules/wallet/wallet.routes'));
 
 module.exports = router;

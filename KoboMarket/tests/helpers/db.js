@@ -8,8 +8,9 @@ const { VendorProfile } = require('../../src/modules/vendors/vendorProfile.model
 const { Product } = require('../../src/modules/products/product.model');
 const { Review } = require('../../src/modules/reviews/review.model');
 const { Cart } = require('../../src/modules/cart/cart.model');
+const MockPaystackTransaction = require('../../src/mock-paystack/MockPaystackTransaction');
 
-const MODELS = [User, RefreshToken, VendorProfile, Product, Review, Cart];
+const MODELS = [User, RefreshToken, VendorProfile, Product, Review, Cart, MockPaystackTransaction];
 
 async function connect() {
   await mongoose.connect(env.MONGO_URI, {
@@ -26,12 +27,22 @@ async function connect() {
 }
 
 // Wipe everything a test could have created. System accounts (from migrations) stay.
+//
+// !!! TEST-ONLY. Never do this outside tests. !!!
+// ledger_entries and webhook_events are append-only (a trigger rejects UPDATE and
+// DELETE). TRUNCATE is a different command that does not fire row-level triggers,
+// so it can empty them. Then every balance is reset to 0 so it matches the (now
+// empty) ledger, and the audit stays valid. globalSetup already refuses to run
+// unless the database name ends in _test.
 async function clean() {
   await Promise.all(MODELS.map((Model) => Model.deleteMany({})));
-  // Children first because of the foreign keys.
-  await knex('order_items').del();
-  await knex('sub_orders').del();
-  await knex('orders').del();
+  await knex.raw(`
+    TRUNCATE TABLE ledger_entries, transactions, wallet_fundings, webhook_events,
+                   idempotency_keys, payouts, disputes, order_items, sub_orders,
+                   orders, outbox
+    CASCADE
+  `);
+  await knex('accounts').update({ balance_kobo: '0', status: 'ACTIVE' });
   await knex('accounts').where({ owner_type: 'USER' }).del();
 }
 

@@ -35,6 +35,11 @@ const envSchema = z.object({
   REFRESH_TOKEN_TTL: z.string().regex(DURATION, 'use a format like 7d').default('7d'),
 
   PAYSTACK_SECRET_KEY: z.string().min(1),
+  // mock = built-in fake Paystack (dev/tests); live = real api.paystack.co (use a TEST key)
+  PAYSTACK_MODE: z.enum(['mock', 'live']).default('mock'),
+  PAYSTACK_BASE_URL: z.url().default('https://api.paystack.co'),
+  // Where the MOCK provider sends its webhooks (the real Paystack uses its dashboard setting).
+  WEBHOOK_TARGET_URL: z.url().default('http://localhost:3000/api/v1/webhooks/paystack'),
 
   // Basis points: 10000 bps = 100%
   COMMISSION_RATE_BPS: z.coerce.number().int().min(0).max(10000).default(500),

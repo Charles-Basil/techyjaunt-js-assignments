@@ -62,4 +62,30 @@ function buildPage(docs, limit, field) {
 const parseDate = (v) => (typeof v === 'string' ? new Date(v) : null);
 const parseNumber = (v) => (typeof v === 'number' ? v : null);
 
-module.exports = { encodeCursor, decodeCursor, afterCursorFilter, sortSpec, buildPage, parseDate, parseNumber };
+// ---- PostgreSQL version (uuid ids, timestamp text as the sort value) ----
+// The same cursor format (encodeCursor), but the id is a uuid and the
+// timestamp stays a STRING made by Postgres itself (created_at::text). A JS Date
+// would cut Postgres' microseconds down to milliseconds and break the
+// "after this point" comparison.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function decodeSqlCursor(cursor) {
+  try {
+    const { sortValue, _id } = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (typeof sortValue !== 'string' || sortValue.length > 64 || !UUID.test(_id)) throw new Error('bad shape');
+    return { sortValue, id: _id };
+  } catch {
+    throw new AppError('INVALID_CURSOR', 'The cursor is invalid', 400);
+  }
+}
+
+module.exports = {
+  encodeCursor,
+  decodeCursor,
+  decodeSqlCursor,
+  afterCursorFilter,
+  sortSpec,
+  buildPage,
+  parseDate,
+  parseNumber,
+};

@@ -21,6 +21,10 @@ tags:
   - name: Products
   - name: Reviews
   - name: Cart
+  - name: Wallet
+  - name: Webhooks
+  - name: Mock Paystack
+    description: Fake payment provider. Only available when PAYSTACK_MODE=mock and NODE_ENV is not production.
   - name: RBAC test
 
 paths:
@@ -788,6 +792,284 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
 
+  /api/v1/wallet:
+    get:
+      summary: Your wallet balance
+      description: Creates the wallet first if it is somehow missing. balanceKobo is whole kobo (100 kobo = NGN 1).
+      tags: [Wallet]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Your wallet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: '#/components/schemas/Wallet' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/wallet/transactions:
+    get:
+      summary: Your wallet's ledger entries, newest first (cursor paginated)
+      tags: [Wallet]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WalletEntry' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400':
+          description: Bad limit (VALIDATION_ERROR) or cursor (INVALID_CURSOR)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/wallet/fund:
+    post:
+      summary: Start adding money to your wallet
+      description: |
+        Creates a PENDING funding and returns the payment page URL. **No money moves yet.**
+        The wallet is credited only when the verified `charge.success` webhook arrives.
+        Requires an `Idempotency-Key`: retrying with the same key and body returns the
+        stored response (header `Idempotent-Replayed: true`) instead of creating a second funding.
+      tags: [Wallet]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [amountKobo]
+              properties:
+                amountKobo:
+                  type: integer
+                  minimum: 10000
+                  maximum: 100000000
+                  description: NGN 100 to NGN 1,000,000, in kobo
+            example:
+              amountKobo: 250000
+      responses:
+        '201':
+          description: Funding started
+          headers:
+            Idempotent-Replayed:
+              description: '"true" when this is a stored response for a repeated request'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: '#/components/schemas/FundingStarted' }
+        '400':
+          description: IDEMPOTENCY_KEY_REQUIRED, INVALID_IDEMPOTENCY_KEY or VALIDATION_ERROR (stored and replayed like any answer)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: IDEMPOTENCY_KEY_REQUIRED, message: The Idempotency-Key header is required, details: null }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Account frozen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: IDEMPOTENCY_KEY_REUSED (same key, different body) or REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: IDEMPOTENCY_KEY_REUSED, message: This Idempotency-Key was already used with a different request, details: null }
+        '502':
+          description: The payment provider could not start the payment. Not stored, so you may retry with the same key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/wallet/fundings/{reference}:
+    get:
+      summary: Status of one of your fundings
+      description: Someone else's reference returns 404.
+      tags: [Wallet]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: reference, required: true, schema: { type: string }, example: FUND_3b8f0c1e-2a4d-4c55-9f1e-1c2d3e4f5a6b }
+      responses:
+        '200':
+          description: The funding
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { $ref: '#/components/schemas/Funding' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: FUNDING_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/webhooks/paystack:
+    post:
+      summary: Paystack webhook receiver (called by Paystack, not by apps)
+      description: |
+        Authenticated by the `x-paystack-signature` header: HMAC-SHA512 (hex) of the raw request
+        body, keyed with the Paystack secret key. Every request is recorded in webhook_events.
+        For `charge.success` the payment is re-verified with Paystack (status, currency, amount)
+        before the wallet is credited, and it is credited exactly once however many times the
+        event is delivered. Every validly signed event gets 200 so Paystack stops retrying.
+        A 500 (e.g. Paystack unreachable during verification) makes Paystack retry later.
+        Not behind the API rate limiter.
+      tags: [Webhooks]
+      parameters:
+        - in: header
+          name: x-paystack-signature
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaystackEvent' }
+      responses:
+        '200':
+          description: Received (credited, already processed, ignored, or not verified)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: boolean, example: true }
+        '401':
+          description: Missing or invalid signature. Nothing is processed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: INVALID_SIGNATURE, message: Invalid webhook signature, details: null }
+
+  /mock-paystack/checkout/{reference}:
+    get:
+      summary: The mock "payment page" for a funding (authorizationUrl points here)
+      tags: [Mock Paystack]
+      parameters:
+        - { in: path, name: reference, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Mock transaction details and how to pay
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      reference: { type: string }
+                      amountKobo: { type: integer }
+                      email: { type: string }
+                      status: { type: string, enum: [pending, success, failed] }
+                      howToPay: { type: string }
+        '404':
+          description: MOCK_TRANSACTION_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /mock-paystack/checkout/{reference}/pay:
+    post:
+      summary: Simulate the buyer paying (or failing), then send signed webhook(s)
+      description: |
+        Marks the mock payment, then POSTs the `charge.success` (or `charge.failed`) webhook to
+        WEBHOOK_TARGET_URL `duplicates` times, signed exactly like Paystack. Use duplicates > 1
+        to see that the wallet is still credited once. A payment's outcome can't change later.
+      tags: [Mock Paystack]
+      parameters:
+        - { in: path, name: reference, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                outcome: { type: string, enum: [success, failed], default: success }
+                duplicates: { type: integer, minimum: 1, maximum: 5, default: 2 }
+            example:
+              outcome: success
+              duplicates: 3
+      responses:
+        '200':
+          description: What each webhook delivery got back
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      reference: { type: string }
+                      outcome: { type: string }
+                      deliveries:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            attempt: { type: integer }
+                            status: { type: integer, nullable: true }
+                            body: { type: object, nullable: true }
+                            error: { type: string }
+              example:
+                success: true
+                data:
+                  reference: FUND_3b8f0c1e-2a4d-4c55-9f1e-1c2d3e4f5a6b
+                  outcome: success
+                  deliveries:
+                    - { attempt: 1, status: 200, body: { received: true } }
+                    - { attempt: 2, status: 200, body: { received: true } }
+                    - { attempt: 3, status: 200, body: { received: true } }
+        '404':
+          description: MOCK_TRANSACTION_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: MOCK_ALREADY_PAID (trying to change the outcome)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /api/v1/admin/ping:
     get:
       summary: RBAC test route (ADMIN only)
@@ -846,6 +1128,15 @@ components:
       name: cursor
       description: The `nextCursor` value from the previous page
       schema: { type: string }
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: |
+        A unique value per action (generate one per button click, reuse it only for retries).
+        8-100 characters: letters, digits, - and _. Scoped per user and endpoint.
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{8,100}$' }
+      example: fund_2f1c9a7e-6b4d-4f0a-8c3e-91d2b7a5e004
 
   responses:
     NotFound:
@@ -1150,6 +1441,62 @@ components:
               unavailable: false
               addedAt: '2026-11-21T10:00:00.000Z'
           subtotalKobo: 600000
+
+    Wallet:
+      type: object
+      properties:
+        accountId: { type: string, format: uuid }
+        currency: { type: string, example: NGN }
+        balanceKobo: { type: integer, example: 250000 }
+        status: { type: string, enum: [ACTIVE, FROZEN] }
+
+    WalletEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: Ledger entry id }
+        transactionId: { type: string, format: uuid }
+        reference: { type: string, example: 'WALLET_FUNDING:FUND_3b8f0c1e-2a4d-4c55-9f1e-1c2d3e4f5a6b' }
+        type: { type: string, example: WALLET_FUNDING }
+        direction: { type: string, enum: [DEBIT, CREDIT], description: 'CREDIT adds to your balance, DEBIT takes from it' }
+        amountKobo: { type: integer, example: 250000 }
+        createdAt: { type: string, format: date-time }
+        metadata: { type: object }
+
+    FundingStarted:
+      type: object
+      properties:
+        reference: { type: string, example: FUND_3b8f0c1e-2a4d-4c55-9f1e-1c2d3e4f5a6b }
+        amountKobo: { type: integer, example: 250000 }
+        authorizationUrl: { type: string, example: 'http://localhost:3000/mock-paystack/checkout/FUND_3b8f0c1e-2a4d-4c55-9f1e-1c2d3e4f5a6b' }
+        status: { type: string, example: PENDING }
+
+    Funding:
+      type: object
+      properties:
+        reference: { type: string }
+        amountKobo: { type: integer }
+        currency: { type: string, example: NGN }
+        status: { type: string, enum: [PENDING, SUCCESS, FAILED] }
+        failureReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        paidAt: { type: string, format: date-time, nullable: true }
+
+    PaystackEvent:
+      type: object
+      properties:
+        event: { type: string, example: charge.success }
+        data:
+          type: object
+          properties:
+            reference: { type: string }
+            amount: { type: integer, description: In kobo }
+            currency: { type: string, example: NGN }
+            status: { type: string, example: success }
+            paid_at: { type: string, format: date-time }
+            customer:
+              type: object
+              properties:
+                email: { type: string }
 
     MessageResponse:
       type: object
