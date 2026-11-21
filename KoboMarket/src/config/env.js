@@ -8,6 +8,7 @@
 // and dotenv silently does nothing.
 const path = require('path');
 const { z } = require('zod');
+const cron = require('node-cron');
 
 const envFile = process.env.NODE_ENV === 'test' ? '.env.test' : '.env';
 require('dotenv').config({ path: path.join(__dirname, '..', '..', envFile), quiet: true });
@@ -44,6 +45,11 @@ const envSchema = z.object({
   // Basis points: 10000 bps = 100%
   COMMISSION_RATE_BPS: z.coerce.number().int().min(0).max(10000).default(500),
   ESCROW_TIMEOUT_HOURS: z.coerce.number().int().positive().default(72),
+  // When the auto-complete job runs (cron syntax). Default: every minute.
+  AUTO_COMPLETE_CRON: z
+    .string()
+    .default('* * * * *')
+    .refine((value) => cron.validate(value), 'must be a valid cron expression, e.g. "* * * * *"'),
   PAYOUT_MIN_KOBO: z.coerce.number().int().positive().default(100000),
 
   CORS_ORIGIN: z.string().min(1),

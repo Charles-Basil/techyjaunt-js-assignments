@@ -12,8 +12,10 @@ router.use('/users', require('../modules/users/users.routes'));
 router.use('/vendors', require('../modules/vendors/vendors.routes'));
 router.use('/products', require('../modules/products/products.routes'));
 router.use('/cart', require('../modules/cart/cart.routes'));
-router.use('/admin', require('../modules/admin/admin.routes'));
-router.use('/vendor', require('../modules/vendors/vendorPing.routes')); // RBAC test route only
 router.use('/wallet', require('../modules/wallet/wallet.routes'));
+router.use('/orders', require('../modules/orders/orders.routes'));
+router.use('/sub-orders', require('../modules/orders/subOrders.routes'));
+router.use('/admin', require('../modules/admin/admin.routes'));
+router.use('/vendor', require('../modules/vendors/vendorArea.routes')); // the logged-in vendor's area
 
 module.exports = router;

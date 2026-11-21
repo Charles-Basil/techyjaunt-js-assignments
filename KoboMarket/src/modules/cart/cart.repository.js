@@ -25,4 +25,13 @@ function save(cart) {
   return cart.save();
 }
 
-module.exports = { findByUserId, getOrCreate, save };
+// After a successful checkout: remove exactly the purchased product+variant lines.
+// $inc __v bumps the version, so a cart edit that loaded the old version fails
+// with CART_CONFLICT instead of silently putting the bought items back.
+function removePurchasedItems(userId, lines) {
+  if (lines.length === 0) return Promise.resolve();
+  const match = lines.map((l) => ({ productId: l.productId, variantId: l.variantId || null }));
+  return Cart.updateOne({ userId }, { $pull: { items: { $or: match } }, $inc: { __v: 1 } });
+}
+
+module.exports = { findByUserId, getOrCreate, save, removePurchasedItems };

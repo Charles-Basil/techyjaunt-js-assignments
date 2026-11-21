@@ -247,6 +247,136 @@ user action and reuse it **only** to retry that same action.
 - Known limit: if the server crashes mid-request, that key stays "in progress"
   (409) until the row is removed. A cleanup job for old in-progress rows can come later.
 
+## Checkout and escrow
+
+`POST /orders/checkout` (auth, not frozen, `Idempotency-Key` required):
+
+- `{}` checks out **the cart**. `{ "items": [...] }` is **buy now** and leaves the cart alone.
+  Both go through the same `placeOrder` service.
+- Prices are always re-read from the product (cart prices are only snapshots).
+  Problems are all listed in one `409 CART_INVALID`. Buying your own product is
+  `400 CANNOT_BUY_OWN_PRODUCT`.
+- One **order** per checkout, one **sub-order per vendor**, one **order_item** per product line.
+- The buyer's money moves into escrow immediately:
+
+| Moment | DEBIT | CREDIT |
+| --- | --- | --- |
+| Checkout (`ORDER_PAYMENT:<orderId>`) | buyer wallet: total | `PLATFORM_ESCROW`: total |
+| Buyer confirms / 72h after shipping (`ORDER_RELEASE:<subOrderId>`) | `PLATFORM_ESCROW`: subtotal | vendor wallet: subtotal - commission, `PLATFORM_REVENUE`: commission |
+| Cancel / out of stock (`ORDER_REFUND:<orderId>`) | `PLATFORM_ESCROW` | buyer wallet |
+
+- **Commission** = `subtotal * bps / 10000` in BigInt, which rounds **down**: 333 kobo
+  at 5% gives 16 commission and 317 to the vendor. The rate is **copied onto each
+  sub-order at checkout**, so an admin changing `settings.commission_rate_bps`
+  later never changes an existing order.
+- Every ledger reference above is UNIQUE: an order can't be paid twice, a sub-order
+  can't be released twice, and an order can't be refunded twice.
+- **Auto-complete** (`src/jobs/autoComplete.job.js`, `AUTO_COMPLETE_CRON`, default
+  every minute): sub-orders SHIPPED or DELIVERED more than `ESCROW_TIMEOUT_HOURS`
+  (72) ago, with no OPEN dispute, are completed and released by the `SYSTEM` actor.
+  DISPUTED sub-orders are never selected. Each row is locked with
+  `FOR UPDATE SKIP LOCKED` and the conditions are re-checked under the lock, so a
+  dispute opened a second earlier, or a buyer confirming at the same moment, wins
+  cleanly.
+- **Cancel** (`POST /orders/:id/cancel`): only while nothing has shipped (every
+  non-cancelled sub-order is PAID). Refund and status changes happen in one
+  transaction; stock goes back to MongoDB after commit.
+
+## Order state machine
+
+Every status change goes through `orderStateMachine.transition()`
+(`src/modules/orders/orderStateMachine.js`):
+
+```
+                     ┌──────────> CANCELLED            (buyer cancels / out of stock)
+                     │
+PENDING_PAYMENT ──> PAID ──> SHIPPED ──────────────┬──> COMPLETED   (escrow released)
+                               │                   │       ▲
+                               ├──> DELIVERED ─────┤       │
+                               │       │           │       │
+                               │       ▼           │       │
+                               └──> DISPUTED ──────┴───────┘
+                                       │
+                                       └──> REFUNDED   (next block)
+
+COMPLETED, CANCELLED and REFUNDED are final.
+```
+
+| From | Allowed next |
+| --- | --- |
+| PENDING_PAYMENT | PAID, CANCELLED |
+| PAID | SHIPPED, CANCELLED |
+| SHIPPED | DELIVERED, COMPLETED, DISPUTED |
+| DELIVERED | COMPLETED, DISPUTED |
+| DISPUTED | COMPLETED, REFUNDED |
+| COMPLETED, CANCELLED, REFUNDED | (none) |
+
+- An illegal move gives `409 INVALID_STATE_TRANSITION` with `{ from, to, allowed }`.
+- The update is `UPDATE ... WHERE id = ? AND status = <the status we read>`. If
+  another request changed it first, 0 rows match and we answer 409 instead of
+  overwriting their change.
+- Every change writes a row to **`sub_order_events`** (append-only: who, which role,
+  from, to, note).
+- The parent **order status** is recomputed from its sub-orders: all CANCELLED gives
+  CANCELLED; all final with at least one COMPLETED gives COMPLETED; all REFUNDED or
+  CANCELLED with at least one REFUNDED gives REFUNDED; anything else is IN_PROGRESS.
+- **Why sub-orders start in PAID:** the wallet pays at the same instant the order is
+  created, inside the same transaction. There is no moment when an order exists
+  unpaid. To keep the history complete, checkout still writes a
+  `PENDING_PAYMENT -> PAID` event.
+
+## Concurrency
+
+| Danger | What stops it |
+| --- | --- |
+| Spending the same wallet balance twice | Checkout locks the buyer wallet row (`SELECT ... FOR UPDATE`) **before** reading the balance. A second checkout by the same buyer waits, then reads the reduced balance. The DB `CHECK (balance_kobo >= 0)` is the second safety net. |
+| Deadlocks | Every flow locks rows in one order: **order row, then sub-order rows, then accounts by id** (`ledger.lockAccounts`). Two flows can never each hold a lock the other needs, even when one user is both buyer and vendor (there is a test). |
+| Overselling the last item | MongoDB `updateOne({ _id, stock: { $gte: qty } }, { $inc: { stock: -qty } })`: the check and the decrement are **one atomic operation**, so stock can't go below 0 |
+| Two releases of the same sub-order | Row lock + status check + unique ledger reference `ORDER_RELEASE:<id>` |
+| Double-clicked checkout | Idempotency-Key middleware, plus UNIQUE `orders.idempotency_key` (`<userId>:<key>`) as the database backstop |
+
+**Why exactly 3 of 10 parallel checkouts succeed** (wallet = 3 x price): all 10
+requests reach the transaction at once, but only one can hold the wallet's row
+lock. It sees enough money, pays and commits. The next one gets the lock and sees
+the *new* balance, and so on. After 3 commits the balance is 0, so the remaining 7
+each see "not enough" and get `402`, without creating anything. The test asserts
+exactly `3 x 201 + 7 x 402`, a final balance of 0, 3 orders, and a passing audit.
+
+## Cross-database consistency: checkout
+
+The order and the money live in **PostgreSQL**; the stock lives in **MongoDB**.
+They can't share a transaction, so checkout uses **compensation** and a **recovery job**:
+
+```
+a) Mongo     validate products, current prices, stock          (read only)
+b) Postgres  ONE transaction: lock wallet + escrow, check balance,
+             insert order/sub-orders/items, ORDER_PAYMENT       -> stock_status PENDING
+c) Mongo     take stock, one conditional $inc per item
+d) failed?   put back what was taken, then ONE Postgres transaction:
+             ORDER_REFUND, sub-orders -> CANCELLED              -> stock_status RELEASED
+             (409 OUT_OF_STOCK, or 503 if MongoDB itself failed)
+e) success   stock_status DEDUCTED, remove the bought lines from the cart, emit 'order.placed'
+```
+
+- **Why Postgres first:** the money step is the one that must never be wrong. Once it
+  commits we *know* the buyer paid, and we can always undo it with a refund.
+- **Crash between b and c:** the order is stuck with `stock_status = PENDING`.
+  `src/jobs/stockRecovery.job.js` runs every minute. Each PENDING order older than
+  5 minutes is locked with `FOR UPDATE SKIP LOCKED` and compensated exactly like
+  step d. Compensation only acts while `stock_status` is still PENDING (checked under
+  the row lock) and the refund reference is unique, so the request and the job can
+  never both refund.
+- **The trade-off we chose:** the job **never takes stock**. If the crash happened
+  halfway through step c, a few units stay decremented for a cancelled order, so the
+  shop shows slightly *less* stock than it has. That's the safe direction: we may
+  under-count, but we can never sell an item we don't have.
+- If a request is stuck for over 5 minutes and the job compensates first, the final
+  `PENDING -> DEDUCTED` update matches 0 rows. The request then puts its stock back
+  and answers `409 CHECKOUT_EXPIRED`, and the buyer was refunded by the job.
+- `order.placed`, `order.shipped`, `order.cancelled` and `funds.released` are emitted
+  on `src/events/emitter.js` after commit, on a later tick. A failing listener can
+  never break a request.
+
 ## Cross-database consistency: user -> wallet
 
 Users live in **MongoDB** and wallets (the `accounts` table) live in **PostgreSQL**.
@@ -295,12 +425,13 @@ src/
   middlewares/        requestId, errorHandler, notFound, validate, auth, rbac, notFrozen, idempotency
   routes/             /health and the /api/v1 router
   modules/            One folder per feature (routes -> controllers -> services -> repositories)
-  jobs/               Background jobs (walletReconciler.job.js)
+  jobs/               walletReconciler, autoComplete (escrow timeout), stockRecovery (checkout crash safety)
+  policies/           orderPolicy.js: who may see / act on an order
   utils/              AppError, cursor pagination, slugs, tokens, shared zod schemas
   ledger/             ledger.service.js (the only code that moves money), audit.js
   integrations/       paystack.client.js (mock or live provider)
   mock-paystack/      Fake Paystack: provider, checkout routes, signed webhook sender
-  events/             (later blocks)
+  events/             emitter.js: in-process domain events (order.placed, funds.released, ...)
 db/migrations/        Knex migrations (Postgres)
 db/seeds/             Knex seeds
 docs/openapi.yaml     API documentation served at /api-docs

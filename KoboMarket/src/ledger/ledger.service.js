@@ -89,14 +89,9 @@ async function postTransaction(trx, { reference, type, idempotencyKey = null, me
   // and the caller's outer transaction is still usable.
   try {
     return await trx.transaction(async (sp) => {
-      // 1. Lock every involved account row. ORDER BY id means every transaction
-      //    locks accounts in the same order, so two transfers between the same
-      //    accounts can't each hold one lock and wait for the other (deadlock).
-      const accountIds = [...netByAccount.keys()];
-      const accounts = await sp('accounts').whereIn('id', accountIds).orderBy('id').forUpdate();
-      if (accounts.length !== accountIds.length) {
-        throw new AppError('LEDGER_ACCOUNT_NOT_FOUND', 'A ledger account does not exist', 500);
-      }
+      // 1. Lock every involved account row (in id order, see lockAccounts).
+      //    If the caller already locked them in this transaction, this is a no-op.
+      const accounts = await lockAccounts(sp, [...netByAccount.keys()]);
       if (!metadata.allowFrozen && accounts.some((a) => a.status === 'FROZEN')) {
         throw new AppError('ACCOUNT_FROZEN', 'This account is frozen', 403);
       }
@@ -135,8 +130,26 @@ async function postTransaction(trx, { reference, type, idempotencyKey = null, me
   }
 }
 
-// A platform account by code, e.g. 'PLATFORM_ESCROW'. (No lock here: only
-// postTransaction locks, always in id order.)
+/**
+ * Locks account rows until the transaction ends: SELECT ... FOR UPDATE ORDER BY id.
+ * EVERY flow that locks accounts goes through here, so all of them take the
+ * locks in the same (id) order. Two flows can then never each hold one lock
+ * while waiting for the other's (a deadlock). That holds even when one user is
+ * both the buyer and the vendor.
+ * Returns the locked rows (with up-to-date balances), in id order.
+ */
+async function lockAccounts(trx, accountIds) {
+  assertInTransaction(trx);
+  const ids = [...new Set(accountIds.map(String))];
+  const accounts = await trx('accounts').whereIn('id', ids).orderBy('id').forUpdate();
+  if (accounts.length !== ids.length) {
+    throw new AppError('LEDGER_ACCOUNT_NOT_FOUND', 'A ledger account does not exist', 500);
+  }
+  return accounts;
+}
+
+// A platform account by code, e.g. 'PLATFORM_ESCROW'. (No lock here: locking
+// happens only in lockAccounts, always in id order.)
 async function getSystemAccount(trx, code) {
   assertInTransaction(trx);
   const account = await trx('accounts').where({ owner_type: 'SYSTEM', code }).first();
@@ -159,4 +172,4 @@ async function getUserAccount(trx, userId) {
   return account;
 }
 
-module.exports = { postTransaction, getSystemAccount, getUserAccount };
+module.exports = { postTransaction, lockAccounts, getSystemAccount, getUserAccount };

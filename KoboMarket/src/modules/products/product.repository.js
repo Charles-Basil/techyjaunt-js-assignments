@@ -79,7 +79,42 @@ function addRating(id, rating) {
   );
 }
 
+// ---------- stock (checkout) ----------
+// Conditional and atomic: the filter only matches if enough stock is left, and
+// the $inc happens in the same single operation. Two buyers racing for the last
+// item can't both succeed, and stock never goes below 0.
+// Returns true if the stock was taken, false if it sold out in the meantime.
+async function decrementStock(productId, variantId, quantity) {
+  const filter = variantId
+    ? {
+        _id: productId,
+        isActive: true,
+        isDeleted: false,
+        variants: { $elemMatch: { _id: variantId, stock: { $gte: quantity } } },
+      }
+    : { _id: productId, isActive: true, isDeleted: false, stock: { $gte: quantity } };
+  // 'variants.$' = the array element matched by $elemMatch above.
+  const update = variantId ? { $inc: { 'variants.$.stock': -quantity } } : { $inc: { stock: -quantity } };
+  const result = await Product.updateOne(filter, update);
+  return result.modifiedCount === 1;
+}
+
+// Puts stock back (failed checkout, cancellation). No conditions: even a
+// product deleted since then gets its count corrected.
+async function incrementStock(productId, variantId, quantity) {
+  if (variantId) {
+    await Product.updateOne(
+      { _id: productId, 'variants._id': variantId },
+      { $inc: { 'variants.$.stock': quantity } }
+    );
+  } else {
+    await Product.updateOne({ _id: productId }, { $inc: { stock: quantity } });
+  }
+}
+
 module.exports = {
+  decrementStock,
+  incrementStock,
   create,
   findById,
   findVisibleBySlug,

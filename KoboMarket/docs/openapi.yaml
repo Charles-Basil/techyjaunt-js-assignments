@@ -22,6 +22,21 @@ tags:
   - name: Reviews
   - name: Cart
   - name: Wallet
+  - name: Orders
+    description: |
+      Checkout pays from the wallet into ESCROW. Each vendor's part of an order is a
+      sub-order with its own status:
+
+      ```
+      PENDING_PAYMENT ─> PAID ─┬─> SHIPPED ─┬─> DELIVERED ─┬─> COMPLETED   (escrow released to vendor)
+                               │            │              └─> DISPUTED
+                               │            ├─> COMPLETED
+                               │            └─> DISPUTED ─┬─> COMPLETED
+                               └─> CANCELLED              └─> REFUNDED
+      ```
+      COMPLETED, CANCELLED and REFUNDED are final. Sub-orders are created directly in PAID
+      (the wallet pays instantly) with a PENDING_PAYMENT -> PAID event in their history.
+  - name: Fulfilment
   - name: Webhooks
   - name: Mock Paystack
     description: Fake payment provider. Only available when PAYSTACK_MODE=mock and NODE_ENV is not production.
@@ -937,6 +952,267 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
 
+  /api/v1/orders/checkout:
+    post:
+      summary: Place an order paid from your wallet (money goes into escrow)
+      description: |
+        Send `{}` to check out your **cart** (bought lines are removed from it), or
+        `{ "items": [...] }` to **buy now** without touching the cart. Prices are always the
+        CURRENT product prices. One sub-order is created per vendor, in status PAID.
+        The vendor is paid only when the buyer confirms, or automatically 72h after shipping.
+
+        Requires an `Idempotency-Key`: a retry with the same key and body returns the stored
+        response (header `Idempotent-Replayed: true`) and never creates a second order.
+      tags: [Orders]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [productId, quantity]
+                    properties:
+                      productId: { type: string }
+                      variantId: { type: string }
+                      quantity: { type: integer, minimum: 1, maximum: 100 }
+            examples:
+              cart: { summary: Check out my cart, value: {} }
+              buyNow: { summary: Buy now, value: { items: [{ productId: 674a1f0c2b9e4c0012ab34cd, quantity: 2 }] } }
+      responses:
+        '201':
+          description: Order placed and paid; stock reserved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResponse' }
+        '400':
+          description: VALIDATION_ERROR, CART_EMPTY, CANNOT_BUY_OWN_PRODUCT or IDEMPOTENCY_KEY_REQUIRED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Wallet balance too low. Nothing is created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: INSUFFICIENT_FUNDS, message: Your wallet balance is too low for this order, details: { balanceKobo: 50000, requiredKobo: 100000 } }
+        '403':
+          description: Account frozen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: |
+            CART_INVALID (unavailable / not enough stock, listed in details), OUT_OF_STOCK
+            (sold out during checkout; you were refunded), IDEMPOTENCY_KEY_REUSED or REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error:
+                  code: OUT_OF_STOCK
+                  message: An item sold out while you were checking out; you have not been charged
+                  details: { orderId: 3f1c2b8e-0a4d-4c55-9f1e-1c2d3e4f5a6b, productId: 674a1f0c2b9e4c0012ab34cd, variantId: null, name: Red Sneakers, requested: 1 }
+        '503':
+          description: STOCK_UPDATE_FAILED (MongoDB unavailable). Refunded; safe to retry with the same key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/orders:
+    get:
+      summary: Your orders, newest first (cursor paginated)
+      tags: [Orders]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [IN_PROGRESS, COMPLETED, CANCELLED, REFUNDED] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of orders (with sub-orders and items)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/orders/{orderId}:
+    get:
+      summary: One order with sub-orders, items and status history
+      description: Visible to the buyer who placed it and to ADMINs. Anyone else gets 404.
+      tags: [Orders]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/OrderIdPath' }
+      responses:
+        '200':
+          description: The order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/orders/{orderId}/cancel:
+    post:
+      summary: Cancel your order before anything has shipped
+      description: |
+        Allowed only while every non-cancelled sub-order is PAID. Refunds escrow to your wallet
+        in one transaction and puts the stock back.
+      tags: [Orders]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/OrderIdPath' }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false }
+            example: {}
+      responses:
+        '200':
+          description: Cancelled and refunded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Account frozen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: ORDER_NOT_CANCELLABLE (something already shipped, or already cancelled)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/vendor/sub-orders:
+    get:
+      summary: The sub-orders you have to fulfil (VENDOR), newest first
+      tags: [Fulfilment]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING_PAYMENT, PAID, SHIPPED, DELIVERED, COMPLETED, CANCELLED, DISPUTED, REFUNDED] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of your sub-orders with items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SubOrder' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/sub-orders/{subOrderId}/ship:
+    patch:
+      summary: Mark your sub-order as shipped (VENDOR, owner) - PAID -> SHIPPED
+      description: Starts the escrow timeout. Without a confirmation or dispute, it auto-completes 72h after shipped_at.
+      tags: [Fulfilment]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/SubOrderIdPath' }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                trackingNumber: { type: string, maxLength: 100 }
+            example:
+              trackingNumber: GIG-1234567
+      responses:
+        '200': { $ref: '#/components/responses/SubOrderOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not a vendor (FORBIDDEN) or another vendor's sub-order (NOT_SUB_ORDER_OWNER)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /api/v1/sub-orders/{subOrderId}/deliver:
+    patch:
+      summary: Mark your sub-order as delivered (VENDOR, owner) - SHIPPED -> DELIVERED
+      description: The courier delivered it. The buyer can still confirm or dispute.
+      tags: [Fulfilment]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/SubOrderIdPath' }
+      responses:
+        '200': { $ref: '#/components/responses/SubOrderOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: FORBIDDEN or NOT_SUB_ORDER_OWNER
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
+  /api/v1/sub-orders/{subOrderId}/confirm:
+    patch:
+      summary: Confirm you received it (buyer) - releases escrow to the vendor
+      description: |
+        SHIPPED or DELIVERED -> COMPLETED, in one transaction with the payout:
+        DEBIT escrow subtotal, CREDIT vendor wallet (subtotal - commission), CREDIT platform
+        revenue (commission, using the rate stored on the sub-order at checkout).
+        A sub-order can never be released twice.
+      tags: [Fulfilment]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/SubOrderIdPath' }
+      responses:
+        '200': { $ref: '#/components/responses/SubOrderOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/InvalidTransition' }
+
   /api/v1/webhooks/paystack:
     post:
       summary: Paystack webhook receiver (called by Paystack, not by apps)
@@ -1128,6 +1404,16 @@ components:
       name: cursor
       description: The `nextCursor` value from the previous page
       schema: { type: string }
+    OrderIdPath:
+      in: path
+      name: orderId
+      required: true
+      schema: { type: string, format: uuid }
+    SubOrderIdPath:
+      in: path
+      name: subOrderId
+      required: true
+      schema: { type: string, format: uuid }
     IdempotencyKey:
       in: header
       name: Idempotency-Key
@@ -1139,6 +1425,29 @@ components:
       example: fund_2f1c9a7e-6b4d-4f0a-8c3e-91d2b7a5e004
 
   responses:
+    SubOrderOk:
+      description: The updated sub-order
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean, example: true }
+              data:
+                type: object
+                properties:
+                  subOrder: { $ref: '#/components/schemas/SubOrder' }
+    InvalidTransition:
+      description: The sub-order's current status does not allow this action
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            error:
+              code: INVALID_STATE_TRANSITION
+              message: Cannot complete a sub-order that is PAID
+              details: { from: PAID, to: COMPLETED, allowed: [SHIPPED, CANCELLED] }
     NotFound:
       description: Not found
       content:
@@ -1480,6 +1789,73 @@ components:
         failureReason: { type: string, nullable: true }
         createdAt: { type: string, format: date-time }
         paidAt: { type: string, format: date-time, nullable: true }
+
+    OrderItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        productId: { type: string }
+        variantId: { type: string, nullable: true }
+        name: { type: string }
+        unitPriceKobo: { type: integer, example: 100000 }
+        quantity: { type: integer, example: 2 }
+        lineTotalKobo: { type: integer, example: 200000 }
+
+    SubOrderEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fromStatus: { type: string, nullable: true, example: PAID }
+        toStatus: { type: string, example: SHIPPED }
+        actorId: { type: string, description: "A user id, or SYSTEM for background jobs" }
+        actorRole: { type: string, enum: [BUYER, VENDOR, ADMIN, SYSTEM] }
+        note: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    SubOrder:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        vendorId: { type: string }
+        buyerId: { type: string }
+        status: { type: string, enum: [PENDING_PAYMENT, PAID, SHIPPED, DELIVERED, COMPLETED, CANCELLED, DISPUTED, REFUNDED] }
+        subtotalKobo: { type: integer, example: 200000 }
+        commissionRateBps: { type: integer, example: 500, description: Copied from settings at checkout }
+        commissionKobo: { type: integer, nullable: true, description: Set when completed }
+        trackingNumber: { type: string, nullable: true }
+        cancelReason: { type: string, nullable: true, example: BUYER_CANCELLED }
+        shippedAt: { type: string, format: date-time, nullable: true }
+        deliveredAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        items: { type: array, items: { $ref: '#/components/schemas/OrderItem' } }
+        events:
+          type: array
+          description: Status history (on GET /orders/{orderId} and checkout)
+          items: { $ref: '#/components/schemas/SubOrderEvent' }
+
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        buyerId: { type: string }
+        status: { type: string, enum: [IN_PROGRESS, COMPLETED, CANCELLED, REFUNDED] }
+        totalKobo: { type: integer, example: 200000 }
+        stockStatus: { type: string, enum: [PENDING, DEDUCTED, RELEASED] }
+        cancelReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        subOrders: { type: array, items: { $ref: '#/components/schemas/SubOrder' } }
+
+    OrderResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            order: { $ref: '#/components/schemas/Order' }
 
     PaystackEvent:
       type: object

@@ -46,15 +46,22 @@ async function createProduct(vendor, overrides = {}) {
   return res.body.data.product;
 }
 
-// Inserts orders -> sub_orders -> order_items rows directly in Postgres,
-// standing in for a finished purchase until the checkout block exists.
+// Inserts orders -> sub_orders -> order_items rows directly in Postgres, as a
+// stand-in for a finished purchase (used by the review tests; no money moves).
 async function insertCompletedPurchase({ buyerId, vendorId, productId, priceKobo = 1500000, quantity = 1 }) {
   const total = priceKobo * quantity;
   const [order] = await knex('orders')
-    .insert({ buyer_id: buyerId, status: 'COMPLETED', total_kobo: total })
+    .insert({ buyer_id: buyerId, status: 'COMPLETED', total_kobo: total, stock_status: 'DEDUCTED' })
     .returning('id');
   const [subOrder] = await knex('sub_orders')
-    .insert({ order_id: order.id, vendor_id: vendorId, status: 'COMPLETED', subtotal_kobo: total })
+    .insert({
+      order_id: order.id,
+      vendor_id: vendorId,
+      buyer_id: buyerId,
+      status: 'COMPLETED',
+      subtotal_kobo: total,
+      commission_rate_bps: 500,
+    })
     .returning('id');
   await knex('order_items').insert({
     sub_order_id: subOrder.id,

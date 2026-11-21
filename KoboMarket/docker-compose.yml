@@ -1,5 +1,8 @@
 # Start everything:  docker compose up --build
 # Values like ${PG_USER} are read from the .env file in this folder.
+# An explicit project name (it also names the containers, e.g. kobomarket-api-1).
+name: kobomarket
+
 services:
   api:
     build: .
