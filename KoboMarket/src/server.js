@@ -4,6 +4,7 @@ const logger = require('./config/logger');
 const app = require('./app');
 const { connectMongo, disconnectMongo } = require('./config/mongo');
 const { connectPostgres, disconnectPostgres } = require('./config/knex');
+const walletReconciler = require('./jobs/walletReconciler.job');
 
 let server;
 let shuttingDown = false;
@@ -14,6 +15,8 @@ async function start() {
   server = app.listen(env.PORT, () => {
     logger.info(`KoboMarket API listening on port ${env.PORT} (${env.NODE_ENV})`);
   });
+  // Background jobs start only after both databases are connected.
+  walletReconciler.start();
 }
 
 async function shutdown(signal, exitCode = 0) {
@@ -29,6 +32,7 @@ async function shutdown(signal, exitCode = 0) {
   }, 10000).unref();
 
   try {
+    walletReconciler.stop(); // no new job runs during shutdown
     // Stop accepting new requests and wait for in-flight ones to finish.
     if (server) await new Promise((resolve) => server.close(resolve));
     await disconnectMongo();

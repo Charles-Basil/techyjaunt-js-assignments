@@ -1,12 +1,25 @@
 // Loads .env and validates every variable ONCE at startup.
 // If anything is missing or wrong, the app refuses to start (fail fast)
 // instead of crashing later in the middle of a payment.
-require('dotenv').config({ quiet: true });
+//
+// Tests (NODE_ENV=test, which Jest sets automatically) read .env.test instead,
+// so they use the separate kobomarket_test databases.
+// Inside Docker there is no .env file: compose passes the variables directly,
+// and dotenv silently does nothing.
+const path = require('path');
 const { z } = require('zod');
+
+const envFile = process.env.NODE_ENV === 'test' ? '.env.test' : '.env';
+require('dotenv').config({ path: path.join(__dirname, '..', '..', envFile), quiet: true });
+
+// Durations like "15m", "7d", "30s", "1h"
+const DURATION = /^\d+[smhd]$/;
 
 const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  // Used to build links in emails, e.g. the verify-email link.
+  APP_BASE_URL: z.string().default('http://localhost:3000'),
 
   MONGO_URI: z.string().startsWith('mongodb', 'MONGO_URI must start with mongodb'),
 
@@ -18,8 +31,8 @@ const envSchema = z.object({
 
   JWT_ACCESS_SECRET: z.string().min(32, 'must be at least 32 characters'),
   JWT_REFRESH_SECRET: z.string().min(32, 'must be at least 32 characters'),
-  ACCESS_TOKEN_TTL: z.string().default('15m'),
-  REFRESH_TOKEN_TTL: z.string().default('7d'),
+  ACCESS_TOKEN_TTL: z.string().regex(DURATION, 'use a format like 15m').default('15m'),
+  REFRESH_TOKEN_TTL: z.string().regex(DURATION, 'use a format like 7d').default('7d'),
 
   PAYSTACK_SECRET_KEY: z.string().min(1),
 

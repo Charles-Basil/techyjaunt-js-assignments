@@ -18,7 +18,9 @@
     "audit:ledger": "node scripts/audit-ledger.js"
   },
   "jest": {
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "globalSetup": "./tests/globalSetup.js",
+    "testTimeout": 30000
   },
   "keywords": [],
   "author": "",

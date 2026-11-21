@@ -60,6 +60,8 @@ const apiLimiter = rateLimit({
   limit: 300,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
+  // Tests fire many requests quickly from one IP. The login limiter still runs in tests.
+  skip: () => env.NODE_ENV === 'test',
   handler: (req, res, next) => next(new AppError('RATE_LIMITED', 'Too many requests, slow down', 429)),
 });
 app.use('/api/v1', apiLimiter, apiRouter);

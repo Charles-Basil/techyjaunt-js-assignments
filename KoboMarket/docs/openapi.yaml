@@ -5,8 +5,19 @@ info:
   description: |
     Multi-vendor marketplace with wallets, a double-entry ledger and escrow.
     All money amounts are integers in kobo (100 kobo = 1 NGN).
+
+    **Auth flow:** register -> verify email (token from the email link) -> login ->
+    send `Authorization: Bearer <accessToken>`. When the access token expires (15 min),
+    call `/auth/refresh` with the refresh token to get a NEW pair. Each refresh token
+    works once; reusing an old one logs the user out everywhere.
 servers:
   - url: http://localhost:3000
+tags:
+  - name: System
+  - name: Auth
+  - name: Users
+  - name: RBAC test
+
 paths:
   /health:
     get:
@@ -17,58 +28,475 @@ paths:
           description: Both databases are reachable
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
+              schema: { $ref: '#/components/schemas/HealthResponse' }
         '503':
           description: At least one database is down
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/HealthResponse'
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+
+  /api/v1/auth/register:
+    post:
+      summary: Create an account (sends a verification email)
+      description: |
+        Creates the user with role BUYER and a wallet in Postgres. No tokens are returned:
+        the user must verify their email first. Unknown fields (e.g. `roles`) are rejected.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example:
+              email: ada@example.com
+              password: Password123
+              firstName: Ada
+              lastName: Obi
+              phone: '+2348012345678'
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+              example:
+                success: true
+                data:
+                  user:
+                    id: 674a1f0c2b9e4c0012ab34cd
+                    email: ada@example.com
+                    firstName: Ada
+                    lastName: Obi
+                    phone: '+2348012345678'
+                    roles: [BUYER]
+                    isEmailVerified: false
+                    status: ACTIVE
+                    walletStatus: CREATED
+                    createdAt: '2026-11-21T10:00:00.000Z'
+                    updatedAt: '2026-11-21T10:00:00.000Z'
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: EMAIL_TAKEN, message: An account with this email already exists, details: null }
+
+  /api/v1/auth/verify-email:
+    post:
+      summary: Verify an email address with the token from the email link
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+            example:
+              token: 3f9c2a...e81b
+      responses:
+        '200':
+          description: Email verified
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400':
+          description: Token invalid, already used, or expired (24h)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: INVALID_TOKEN, message: Verification link is invalid or has expired, details: null }
+
+  /api/v1/auth/login:
+    post:
+      summary: Log in and get an access + refresh token
+      description: Rate limited to 5 failed attempts per 15 minutes per email + IP.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+            example:
+              email: ada@example.com
+              password: Password123
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          description: Wrong email or password
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: INVALID_CREDENTIALS, message: Email or password is incorrect, details: null }
+        '403':
+          description: Email not verified (EMAIL_NOT_VERIFIED) or account frozen (ACCOUNT_FROZEN)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: EMAIL_NOT_VERIFIED, message: Please verify your email before logging in, details: null }
+        '429':
+          description: Too many failed attempts
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: TOO_MANY_ATTEMPTS, message: Too many failed login attempts. Try again later., details: null }
+
+  /api/v1/auth/refresh:
+    post:
+      summary: Swap a refresh token for a new access + refresh token (rotation)
+      description: |
+        The refresh token you send is revoked and a new one is returned. If a refresh token
+        that was already used is sent again, all of the user's sessions are revoked
+        (TOKEN_REUSE_DETECTED) because the token was probably stolen.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        '401':
+          description: INVALID_REFRESH_TOKEN (unknown/expired) or TOKEN_REUSE_DETECTED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: TOKEN_REUSE_DETECTED, message: 'Session is no longer valid, please log in again', details: null }
+        '403':
+          description: Account frozen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/auth/logout:
+    post:
+      summary: Revoke a refresh token
+      description: Always returns 200, whether or not the token existed.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+              example:
+                success: true
+                data: { message: Logged out }
+
+  /api/v1/auth/forgot-password:
+    post:
+      summary: Request a password reset email
+      description: Always returns 200 so the response doesn't reveal whether the email is registered.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+            example:
+              email: ada@example.com
+      responses:
+        '200':
+          description: Request accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+              example:
+                success: true
+                data: { message: 'If an account exists for this email, a reset link has been sent' }
+
+  /api/v1/auth/reset-password:
+    post:
+      summary: Set a new password using the token from the reset email
+      description: Also logs the user out on every device (all refresh tokens are revoked).
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token: { type: string }
+                newPassword: { $ref: '#/components/schemas/Password' }
+            example:
+              token: 9b1d4e...07aa
+              newPassword: NewPassword456
+      responses:
+        '200':
+          description: Password changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+        '400':
+          description: Token invalid or expired (30 min), or the new password is too weak
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/users/me:
+    get:
+      summary: Get the logged-in user
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      summary: Update your own profile
+      description: Only firstName, lastName and phone can be changed. Any other field returns 400.
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                firstName: { type: string, maxLength: 50 }
+                lastName: { type: string, maxLength: 50 }
+                phone: { type: string, example: '+2348012345678' }
+            example:
+              firstName: Chioma
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/admin/ping:
+    get:
+      summary: RBAC test route (ADMIN only)
+      tags: [RBAC test]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: You are an admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+              example:
+                success: true
+                data: { message: pong (admin) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/vendor/ping:
+    get:
+      summary: RBAC test route (VENDOR only)
+      tags: [RBAC test]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: You are a vendor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageResponse' }
+              example:
+                success: true
+                data: { message: pong (vendor) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed
+              details:
+                - path: password
+                  message: Password must contain at least one number
+    Unauthorized:
+      description: Missing, invalid or expired access token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            error: { code: UNAUTHORIZED, message: Authentication required, details: null }
+    Forbidden:
+      description: Logged in, but missing the required role
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            error: { code: FORBIDDEN, message: You do not have permission for this action, details: null }
+
   schemas:
-    DependencyCheck:
+    Password:
+      type: string
+      minLength: 8
+      maxLength: 72
+      description: At least 8 characters, with at least one letter and one number.
+      example: Password123
+
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, firstName, lastName]
+      properties:
+        email: { type: string, format: email }
+        password: { $ref: '#/components/schemas/Password' }
+        firstName: { type: string, maxLength: 50 }
+        lastName: { type: string, maxLength: 50 }
+        phone: { type: string, example: '+2348012345678' }
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string }
+      example:
+        refreshToken: 5e0c...b7f2
+
+    User:
       type: object
       properties:
-        status:
-          type: string
-          enum: [OK, DOWN]
-        latencyMs:
-          type: integer
-          nullable: true
-    HealthResponse:
+        id: { type: string }
+        email: { type: string, format: email }
+        firstName: { type: string }
+        lastName: { type: string }
+        phone: { type: string }
+        roles:
+          type: array
+          items: { type: string, enum: [BUYER, VENDOR, ADMIN] }
+        isEmailVerified: { type: boolean }
+        status: { type: string, enum: [ACTIVE, FROZEN] }
+        walletStatus: { type: string, enum: [PENDING, CREATED] }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    UserResponse:
       type: object
       properties:
-        success:
-          type: boolean
+        success: { type: boolean, example: true }
         data:
           type: object
           properties:
-            status:
-              type: string
-              enum: [OK, DEGRADED]
-            uptimeSeconds:
-              type: integer
+            user: { $ref: '#/components/schemas/User' }
+
+    TokenResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            accessToken: { type: string, description: 'JWT, valid for 15 minutes' }
+            refreshToken: { type: string, description: 'Opaque token, valid for 7 days, single use' }
+            tokenType: { type: string, example: Bearer }
+            expiresIn: { type: string, example: 15m }
+      example:
+        success: true
+        data:
+          accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+          refreshToken: 5e0c...b7f2
+          tokenType: Bearer
+          expiresIn: 15m
+
+    MessageResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            message: { type: string }
+
+    DependencyCheck:
+      type: object
+      properties:
+        status: { type: string, enum: [OK, DOWN] }
+        latencyMs: { type: integer, nullable: true }
+
+    HealthResponse:
+      type: object
+      properties:
+        success: { type: boolean }
+        data:
+          type: object
+          properties:
+            status: { type: string, enum: [OK, DEGRADED] }
+            uptimeSeconds: { type: integer }
             checks:
               type: object
               properties:
-                mongo:
-                  $ref: '#/components/schemas/DependencyCheck'
-                postgres:
-                  $ref: '#/components/schemas/DependencyCheck'
+                mongo: { $ref: '#/components/schemas/DependencyCheck' }
+                postgres: { $ref: '#/components/schemas/DependencyCheck' }
+
     ErrorResponse:
       type: object
       properties:
-        success:
-          type: boolean
-          example: false
+        success: { type: boolean, example: false }
         error:
           type: object
           properties:
-            code:
-              type: string
-              example: VALIDATION_ERROR
-            message:
-              type: string
-            details:
-              nullable: true
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details: { nullable: true }
