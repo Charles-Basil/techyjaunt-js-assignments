@@ -1,0 +1,54 @@
+# Start everything:  docker compose up --build
+# Values like ${PG_USER} are read from the .env file in this folder.
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      # Inside Docker, services find each other by service name, not localhost.
+      MONGO_URI: mongodb://mongo:27017/kobomarket
+      PG_HOST: postgres
+      PG_PORT: 5432
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    ports:
+      # Host port 5433 (not 5432) so it doesn't clash with a Postgres
+      # already installed on your machine. Containers still use 5432.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # $$ escapes $ so the variable is expanded inside the container.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mongo_data:
+  postgres_data:

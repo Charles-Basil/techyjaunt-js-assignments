@@ -1,0 +1,74 @@
+openapi: 3.0.3
+info:
+  title: KoboMarket API
+  version: 1.0.0
+  description: |
+    Multi-vendor marketplace with wallets, a double-entry ledger and escrow.
+    All money amounts are integers in kobo (100 kobo = 1 NGN).
+servers:
+  - url: http://localhost:3000
+paths:
+  /health:
+    get:
+      summary: Check that the API, MongoDB and PostgreSQL are up
+      tags: [System]
+      responses:
+        '200':
+          description: Both databases are reachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: At least one database is down
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+components:
+  schemas:
+    DependencyCheck:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [OK, DOWN]
+        latencyMs:
+          type: integer
+          nullable: true
+    HealthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [OK, DEGRADED]
+            uptimeSeconds:
+              type: integer
+            checks:
+              type: object
+              properties:
+                mongo:
+                  $ref: '#/components/schemas/DependencyCheck'
+                postgres:
+                  $ref: '#/components/schemas/DependencyCheck'
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+            details:
+              nullable: true

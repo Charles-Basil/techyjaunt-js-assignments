@@ -1,0 +1,51 @@
+{
+  "name": "kobomarket",
+  "version": "1.0.0",
+  "description": "Multi-vendor marketplace API with wallets, a double-entry ledger and escrow",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "migrate": "knex migrate:latest",
+    "migrate:rollback": "knex migrate:rollback",
+    "seed": "knex seed:run",
+    "test": "jest --runInBand",
+    "audit:ledger": "node scripts/audit-ledger.js"
+  },
+  "jest": {
+    "testEnvironment": "node"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "knex": "^3.3.0",
+    "mongoose": "^9.12.3",
+    "node-cron": "^4.6.0",
+    "pg": "^8.23.1",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "swagger-ui-express": "^5.0.1",
+    "uuid": "^11.1.1",
+    "yamljs": "^0.3.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "jest": "^30.5.2",
+    "nodemon": "^3.1.14",
+    "pino-pretty": "^13.2.0",
+    "supertest": "^7.3.2"
+  }
+}
