@@ -5,6 +5,8 @@ const { requireRole } = require('../../middlewares/rbac');
 const validate = require('../../middlewares/validate');
 const schemas = require('./orders.schemas');
 const controller = require('./orders.controller');
+const disputeSchemas = require('../disputes/disputes.schemas');
+const disputesController = require('../disputes/disputes.controller');
 
 const router = express.Router();
 router.use(authenticate);
@@ -23,7 +25,12 @@ router.patch(
   controller.deliver
 );
 
-// Buyer action: any logged-in user, but only the sub-order's buyer passes the policy check.
+// Buyer actions: any logged-in user, but only the sub-order's buyer passes the policy check.
 router.patch('/:id/confirm', validate({ params: schemas.uuidParam, body: schemas.emptyBody }), controller.confirm);
+router.post(
+  '/:id/disputes',
+  validate({ params: schemas.uuidParam, body: disputeSchemas.openBody }),
+  disputesController.open
+);
 
 module.exports = router;

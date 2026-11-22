@@ -1,12 +1,17 @@
 // Releasing escrow: the moment a vendor actually gets paid.
-// Used by buyer confirm and by the auto-complete job. Everything in ONE transaction:
 //
 //   DEBIT  PLATFORM_ESCROW    subtotal
 //   CREDIT vendor wallet      subtotal - commission
 //   CREDIT PLATFORM_REVENUE   commission           (skipped when 0)
 //
-// The ledger reference ORDER_RELEASE:<subOrderId> is UNIQUE, so even if every
-// other check failed, the same sub-order could never be paid out twice.
+// Two ways in:
+//   releaseSubOrder()       own transaction + locks: buyer confirm, auto-complete job
+//   releaseInTransaction()  inside a caller's transaction: dispute REJECTED
+//
+// Every settlement of a sub-order's escrow (release, or any dispute resolution)
+// uses idempotency_key ESCROW_SETTLEMENT:<subOrderId>, which is UNIQUE in
+// transactions. So the escrow of one sub-order can be paid out at most once,
+// whichever path tries to do it.
 const { knex } = require('../../config/knex');
 const AppError = require('../../utils/AppError');
 const { toKoboNumber } = require('../../utils/money');
@@ -16,9 +21,67 @@ const orderRepository = require('./order.repository');
 const { transition, allowedFrom } = require('./orderStateMachine');
 const { splitCommission } = require('./commission');
 
+const escrowSettlementKey = (subOrderId) => `ESCROW_SETTLEMENT:${subOrderId}`;
+
 /**
- * @param subOrderId
- * @param options.actorId / actorRole  who triggers it (buyer, or 'SYSTEM' for the job)
+ * Pays the vendor from escrow and moves the sub-order to COMPLETED.
+ * The CALLER must already hold the locks on the parent order and the sub-order row.
+ * @returns { subOrder, commissionKobo, vendorAmountKobo }
+ */
+async function releaseInTransaction(
+  trx,
+  subOrder,
+  { actorId, actorRole, note = null, reference = `ORDER_RELEASE:${subOrder.id}`, type = 'ORDER_RELEASE', metadata = {} }
+) {
+  // Commission from the rate STORED on the sub-order at checkout time.
+  const subtotal = BigInt(subOrder.subtotal_kobo);
+  const { commissionKobo, vendorAmountKobo } = splitCommission(subtotal, subOrder.commission_rate_bps);
+
+  const escrow = await ledger.getSystemAccount(trx, 'PLATFORM_ESCROW');
+  const revenue = await ledger.getSystemAccount(trx, 'PLATFORM_REVENUE');
+  const vendorWallet = await ledger.getUserAccount(trx, subOrder.vendor_id);
+  await ledger.lockAccounts(trx, [escrow.id, vendorWallet.id, revenue.id]);
+
+  const entries = [{ accountId: escrow.id, direction: 'DEBIT', amountKobo: subtotal }];
+  if (vendorAmountKobo > 0n) entries.push({ accountId: vendorWallet.id, direction: 'CREDIT', amountKobo: vendorAmountKobo });
+  if (commissionKobo > 0n) entries.push({ accountId: revenue.id, direction: 'CREDIT', amountKobo: commissionKobo });
+
+  await ledger.postTransaction(trx, {
+    reference,
+    type,
+    idempotencyKey: escrowSettlementKey(subOrder.id),
+    // allowFrozen: the vendor earned this; a freeze blocks spending and payouts, not earnings.
+    metadata: {
+      orderId: subOrder.order_id,
+      subOrderId: subOrder.id,
+      commissionRateBps: subOrder.commission_rate_bps,
+      allowFrozen: true,
+      ...metadata,
+    },
+    entries,
+  });
+
+  const updated = await transition(trx, subOrder.id, 'COMPLETED', {
+    actorId,
+    actorRole,
+    note,
+    extraFields: { commission_kobo: commissionKobo.toString(), completed_at: trx.fn.now() },
+  });
+  return { subOrder: updated, commissionKobo, vendorAmountKobo };
+}
+
+function emitReleased(result) {
+  emitEvent('funds.released', {
+    subOrderId: result.subOrder.id,
+    orderId: result.subOrder.order_id,
+    vendorId: result.subOrder.vendor_id,
+    vendorAmountKobo: toKoboNumber(result.vendorAmountKobo),
+    commissionKobo: toKoboNumber(result.commissionKobo),
+  });
+}
+
+/**
+ * Release in its own transaction (buyer confirm, auto-complete job).
  * @param options.fromStatuses  statuses this caller may complete from
  * @param options.skipLocked    jobs: skip rows another request is working on
  * @param options.stillEligible jobs: re-check the job's conditions under the lock
@@ -46,47 +109,11 @@ async function releaseSubOrder(
         allowed: allowedFrom(subOrder.status),
       });
     }
-
-    // Commission from the rate STORED on the sub-order at checkout time.
-    const subtotal = BigInt(subOrder.subtotal_kobo);
-    const { commissionKobo, vendorAmountKobo } = splitCommission(subtotal, subOrder.commission_rate_bps);
-
-    const escrow = await ledger.getSystemAccount(trx, 'PLATFORM_ESCROW');
-    const revenue = await ledger.getSystemAccount(trx, 'PLATFORM_REVENUE');
-    const vendorWallet = await ledger.getUserAccount(trx, subOrder.vendor_id);
-    await ledger.lockAccounts(trx, [escrow.id, vendorWallet.id, revenue.id]);
-
-    const entries = [{ accountId: escrow.id, direction: 'DEBIT', amountKobo: subtotal }];
-    if (vendorAmountKobo > 0n) entries.push({ accountId: vendorWallet.id, direction: 'CREDIT', amountKobo: vendorAmountKobo });
-    if (commissionKobo > 0n) entries.push({ accountId: revenue.id, direction: 'CREDIT', amountKobo: commissionKobo });
-
-    await ledger.postTransaction(trx, {
-      reference: `ORDER_RELEASE:${subOrderId}`,
-      type: 'ORDER_RELEASE',
-      // allowFrozen: the vendor earned this; a freeze blocks spending and payouts, not earnings.
-      metadata: { orderId: subOrder.order_id, subOrderId, commissionRateBps: subOrder.commission_rate_bps, allowFrozen: true },
-      entries,
-    });
-
-    const updated = await transition(trx, subOrderId, 'COMPLETED', {
-      actorId,
-      actorRole,
-      note,
-      extraFields: { commission_kobo: commissionKobo.toString(), completed_at: trx.fn.now() },
-    });
-    return { subOrder: updated, commissionKobo, vendorAmountKobo };
+    return releaseInTransaction(trx, subOrder, { actorId, actorRole, note });
   });
 
-  if (result) {
-    emitEvent('funds.released', {
-      subOrderId,
-      orderId: result.subOrder.order_id,
-      vendorId: result.subOrder.vendor_id,
-      vendorAmountKobo: toKoboNumber(result.vendorAmountKobo),
-      commissionKobo: toKoboNumber(result.commissionKobo),
-    });
-  }
+  if (result) emitReleased(result);
   return result;
 }
 
-module.exports = { releaseSubOrder };
+module.exports = { releaseSubOrder, releaseInTransaction, emitReleased, escrowSettlementKey };

@@ -14,6 +14,8 @@ const ledger = require('../../ledger/ledger.service');
 const paystack = require('../../integrations/paystack/paystack.client');
 const fundingRepository = require('./funding.repository');
 const webhookEventRepository = require('./webhookEvent.repository');
+const payoutRepository = require('../payouts/payout.repository');
+const payoutSettlement = require('../payouts/payout.settlement');
 
 const PROVIDER = 'paystack';
 
@@ -110,6 +112,35 @@ async function handleChargeFailed(reference) {
   return { result: updated ? 'MARKED_FAILED' : 'IGNORED', note: updated ? null : 'Funding not pending' };
 }
 
+// ---------- transfers (vendor payouts) ----------
+// The transfer reference is our payout id. As with charges, the webhook body is
+// only a hint: we ask the provider for the real status, then call the SAME
+// settle()/fail() the payout job uses (they lock the payout row, so a job run
+// and a webhook can't both act).
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function handleTransferEvent(reference) {
+  if (!UUID.test(reference)) return { result: 'UNKNOWN_REFERENCE' };
+  const payout = await payoutRepository.findById(reference);
+  if (!payout) return { result: 'UNKNOWN_REFERENCE' };
+
+  if (payout.status === 'SUCCESS' || payout.status === 'FAILED') {
+    return { result: 'ALREADY_PROCESSED', note: `Payout is already ${payout.status}` };
+  }
+  if (payout.status !== 'PROCESSING') return { result: 'IGNORED', note: 'Payout has not been sent yet' };
+
+  const check = await paystack.verifyTransfer(reference); // network error -> 500 -> Paystack retries
+  if (check.status === 'success') {
+    await payoutSettlement.settle(reference, { providerReference: check.providerReference });
+    return { result: 'PAYOUT_SETTLED' };
+  }
+  if (check.status === 'failed') {
+    await payoutSettlement.fail(reference, check.reason || 'Transfer failed');
+    return { result: 'PAYOUT_FAILED' };
+  }
+  return { result: 'VERIFY_FAILED', note: `Provider transfer status is ${check.status}` };
+}
+
 /**
  * Entry point used by the controller.
  * Throws 401 INVALID_SIGNATURE for unsigned/badly signed requests.
@@ -134,6 +165,8 @@ async function handlePaystackWebhook({ rawBody, signature, payload }) {
     outcome = await handleChargeSuccess(reference);
   } else if (event === 'charge.failed') {
     outcome = await handleChargeFailed(reference);
+  } else if (event === 'transfer.success' || event === 'transfer.failed' || event === 'transfer.reversed') {
+    outcome = await handleTransferEvent(reference);
   } else {
     outcome = { result: 'IGNORED', note: `Unhandled event ${event}` };
   }

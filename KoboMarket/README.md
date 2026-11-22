@@ -61,7 +61,7 @@ npm test
 
 ## Auth overview
 
-- **Passwords**: bcrypt, cost 12. Rule: 8 to 72 characters, at least one letter and one number.
+- **Passwords**: bcrypt, cost 12 (`BCRYPT_COST`; tests use 4 for speed, production refuses less than 10). Rule: 8 to 72 characters, at least one letter and one number.
 - **Email verification / password reset tokens**: 32 random bytes. Only the sha256
   hash is stored. Verification expires in 24h, reset in 30 min, and each token works once.
 - **Access token**: JWT (HS256), 15 minutes, payload `{ sub: userId, roles }`.
@@ -377,6 +377,99 @@ e) success   stock_status DEDUCTED, remove the bought lines from the cart, emit 
   on `src/events/emitter.js` after commit, on a later tick. A failing listener can
   never break a request.
 
+## Disputes and refunds
+
+1. The buyer opens a dispute on a **SHIPPED or DELIVERED** sub-order
+   (`POST /sub-orders/:id/disputes`, with a reason and up to 10 text/image evidence items).
+   In one transaction the dispute row is inserted OPEN and the sub-order moves to **DISPUTED**.
+   A partial unique index allows only one OPEN dispute per sub-order (`409 DISPUTE_ALREADY_OPEN`).
+2. The escrow is now **frozen**: the auto-complete job skips the sub-order twice over
+   (its status is no longer SHIPPED/DELIVERED, *and* `NOT EXISTS` an OPEN dispute).
+   The buyer can't confirm it either.
+3. An ADMIN resolves it (`PATCH /disputes/:id/resolve`, a note is required). One
+   transaction locks order, sub-order, dispute, then accounts (in id order), and posts
+   **one** balanced ledger transaction, `DISPUTE_RESOLUTION:<disputeId>`:
+
+| Resolution | Ledger | Sub-order |
+| --- | --- | --- |
+| `FULL_REFUND` | escrow -> buyer (subtotal) | REFUNDED |
+| `PARTIAL_REFUND` | escrow -> buyer (refund), vendor (rest - commission), revenue (commission) | COMPLETED |
+| `REJECTED` | normal release: escrow -> vendor (95%), revenue (5%), via the same `releaseInTransaction()` code as buyer confirm | COMPLETED |
+
+**Partial refund example** (subtotal 100000, refund 40000, 500 bps). Commission is
+charged only on the part the vendor keeps:
+
+```
+vendor part = 100000 - 40000                = 60000
+commission  = 60000 * 500 / 10000           =  3000   (BigInt, rounds down)
+DEBIT  escrow   100000
+CREDIT buyer     40000
+CREDIT vendor    57000   (60000 - 3000)
+CREDIT revenue    3000
+```
+
+- The dispute row records `resolved_by` (the admin id), `resolution_note` and
+  `resolved_at`. A `sub_order_events` row records the same admin and note.
+- **Never twice:** the dispute row is locked and must be OPEN (`409 DISPUTE_ALREADY_RESOLVED`).
+  The ledger reference is unique. And every escrow settlement of a sub-order (confirm,
+  auto-complete or any resolution) uses the same unique idempotency key
+  `ESCROW_SETTLEMENT:<subOrderId>`, so one sub-order's escrow can be paid out only once,
+  whichever path tries. A test has two admins resolving at the same moment: exactly one wins.
+- Resolutions use `allowFrozen`: an admin's decision must always be able to settle escrow,
+  even if a wallet is frozen.
+
+## Vendor payouts
+
+```
+POST /payouts ─> wallet ──PAYOUT_REQUEST──> PLATFORM_PAYOUT_CLEARING      payout PENDING
+                                                    │
+payouts job (every minute, PAYOUT_JOB_CRON):        │  claim -> PROCESSING -> bank transfer
+   transfer success ──PAYOUT_SETTLED──> PLATFORM_EXTERNAL_SETTLEMENT     payout SUCCESS
+   transfer failed  ──PAYOUT_REVERSAL──> back to the vendor wallet        payout FAILED
+```
+
+- **Request** (`VENDOR`, not frozen, `Idempotency-Key`): needs an APPROVED vendor
+  profile with bank details, and at least `PAYOUT_MIN_KOBO` (NGN 1,000). In one
+  transaction: lock the wallet and clearing accounts, check the balance, insert the
+  payout PENDING with a **masked** bank snapshot (the full account number stays only
+  in the vendor profile), then post `PAYOUT_REQUEST`. **The money leaves the wallet
+  immediately**, so it can't be spent or withdrawn twice while the transfer runs.
+- **Same-millisecond protection:** two requests at the same instant both need the
+  wallet row lock, so they run one after the other. The second one sees either the
+  reduced balance (`402`) or the first payout (the partial unique index "one
+  PENDING/PROCESSING payout per vendor" gives `409 PAYOUT_ALREADY_PENDING`). A vendor
+  can never withdraw more than their balance (tested with `Promise.all`).
+- **The job** (`src/jobs/payouts.job.js`) claims up to 10 PENDING payouts in **one**
+  statement: `UPDATE ... SET status = 'PROCESSING', attempts = attempts + 1 WHERE id IN
+  (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING *`. Two job runs or two servers can
+  never claim the same payout. Each payout calls `initiateTransfer` with
+  **reference = payout id**, so the provider itself refuses to send the same payout twice.
+  - success: `settle()`. Lock the payout (must be PROCESSING), clearing to external
+    (`PAYOUT_SETTLED:<id>`), status SUCCESS.
+  - failed: `fail()`. Clearing back to the vendor wallet (`PAYOUT_REVERSAL:<id>`,
+    `allowFrozen`), status FAILED with the reason. The vendor can request again.
+  - pending (live Paystack, e.g. OTP): stays PROCESSING until `transfer.success` /
+    `transfer.failed` arrives on the webhook (re-verified, then the **same**
+    `settle()`/`fail()`), or the recovery check below.
+  - **the provider threw** (network error: outcome *unknown*): back to PENDING with
+    `last_error`, and retried next run. After 5 attempts we ask `verifyTransfer` once more
+    (never refund money that actually left), and if it didn't go through, `fail()`
+    returns the money.
+- **Crash recovery:** a payout PROCESSING for 15+ minutes is checked with
+  `verifyTransfer`: success settles it, failed fails it, "never received" puts it back
+  to PENDING, and unknown leaves it and logs.
+- Audit check (d) counts `PAYOUT_SETTLED` as money that left the platform, so after a
+  payout, `wallets + escrow + revenue + clearing = funded - paid out` still holds.
+- **Mock transfers** succeed unless the bank account number ends in `0000` or
+  `MOCK_TRANSFER_OUTCOME=failed`.
+- Known limit (live mode only): if Paystack is unreachable for all 5 attempts *and*
+  for the verify call, the payout is failed and refunded. If that transfer later turns
+  out to have succeeded, the `transfer.success` webhook finds the payout FAILED, records
+  it, and an admin must reconcile it by hand.
+
+`npm test` ends with `posttest` (`scripts/audit-test-db.js`): the ledger audit on the
+test database. If the books don't balance, `npm test` fails.
+
 ## Cross-database consistency: user -> wallet
 
 Users live in **MongoDB** and wallets (the `accounts` table) live in **PostgreSQL**.
@@ -412,8 +505,9 @@ duplicate or missing wallet.
 | `npm run migrate`          | Run all pending Postgres migrations           |
 | `npm run migrate:rollback` | Undo the last batch of migrations             |
 | `npm run seed`             | Run seed files (placeholder for now)          |
-| `npm test`                 | Run Jest tests                                |
+| `npm test`                 | Run Jest tests, then the ledger audit on the test DB |
 | `npm run audit:ledger`     | Ledger consistency audit (exit code 1 on FAIL) |
+| `npm run job -- <name>`    | Run one background job once: `payouts`, `auto-complete`, `stock-recovery`, `wallet-reconciler` |
 
 ## Project structure
 
@@ -425,8 +519,8 @@ src/
   middlewares/        requestId, errorHandler, notFound, validate, auth, rbac, notFrozen, idempotency
   routes/             /health and the /api/v1 router
   modules/            One folder per feature (routes -> controllers -> services -> repositories)
-  jobs/               walletReconciler, autoComplete (escrow timeout), stockRecovery (checkout crash safety)
-  policies/           orderPolicy.js: who may see / act on an order
+  jobs/               walletReconciler, autoComplete (escrow timeout), stockRecovery (checkout crash safety), payouts
+  policies/           order, dispute and payout access rules
   utils/              AppError, cursor pagination, slugs, tokens, shared zod schemas
   ledger/             ledger.service.js (the only code that moves money), audit.js
   integrations/       paystack.client.js (mock or live provider)

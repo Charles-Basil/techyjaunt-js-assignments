@@ -7,9 +7,10 @@ const { connectPostgres, disconnectPostgres } = require('./config/knex');
 const walletReconciler = require('./jobs/walletReconciler.job');
 const autoComplete = require('./jobs/autoComplete.job');
 const stockRecovery = require('./jobs/stockRecovery.job');
+const payoutsJob = require('./jobs/payouts.job');
 
 // Background jobs. Started here only (never by app.js), so tests don't run them.
-const JOBS = [walletReconciler, autoComplete, stockRecovery];
+const JOBS = [walletReconciler, autoComplete, stockRecovery, payoutsJob];
 
 let server;
 let shuttingDown = false;

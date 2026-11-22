@@ -161,7 +161,8 @@ describe('Paystack webhook', () => {
     const unknown = JSON.stringify({ event: 'charge.success', data: { reference: 'FUND_does-not-exist', amount: 1 } });
     await postWebhook(unknown, mockService.sign(unknown)).expect(200);
 
-    const other = JSON.stringify({ event: 'transfer.success', data: { reference } });
+    // (transfer.* events are handled since Block 6, so use an event we really ignore)
+    const other = JSON.stringify({ event: 'subscription.create', data: { reference } });
     await postWebhook(other, mockService.sign(other)).expect(200);
 
     const results = await knex('webhook_events').select('reference', 'processing_result').orderBy('received_at');

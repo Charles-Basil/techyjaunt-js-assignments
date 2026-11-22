@@ -9,8 +9,9 @@ const { Product } = require('../../src/modules/products/product.model');
 const { Review } = require('../../src/modules/reviews/review.model');
 const { Cart } = require('../../src/modules/cart/cart.model');
 const MockPaystackTransaction = require('../../src/mock-paystack/MockPaystackTransaction');
+const MockPaystackTransfer = require('../../src/mock-paystack/MockPaystackTransfer');
 
-const MODELS = [User, RefreshToken, VendorProfile, Product, Review, Cart, MockPaystackTransaction];
+const MODELS = [User, RefreshToken, VendorProfile, Product, Review, Cart, MockPaystackTransaction, MockPaystackTransfer];
 
 async function connect() {
   await mongoose.connect(env.MONGO_URI, {

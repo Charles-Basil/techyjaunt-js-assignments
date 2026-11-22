@@ -37,6 +37,15 @@ tags:
       COMPLETED, CANCELLED and REFUNDED are final. Sub-orders are created directly in PAID
       (the wallet pays instantly) with a PENDING_PAYMENT -> PAID event in their history.
   - name: Fulfilment
+  - name: Disputes
+    description: |
+      A buyer disputes a SHIPPED/DELIVERED sub-order; its escrow stays frozen (no auto-complete)
+      until an ADMIN resolves it with FULL_REFUND, PARTIAL_REFUND or REJECTED.
+  - name: Payouts
+    description: |
+      Vendors withdraw wallet money to their bank. The amount leaves the wallet immediately
+      (into payout clearing); a background job sends the transfer. If the transfer fails,
+      the money goes back to the wallet.
   - name: Webhooks
   - name: Mock Paystack
     description: Fake payment provider. Only available when PAYSTACK_MODE=mock and NODE_ENV is not production.
@@ -1213,6 +1222,245 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/InvalidTransition' }
 
+  /api/v1/sub-orders/{subOrderId}/disputes:
+    post:
+      summary: Open a dispute on a sub-order you bought (SHIPPED or DELIVERED only)
+      description: The sub-order becomes DISPUTED and its escrow is frozen until an admin resolves it.
+      tags: [Disputes]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/SubOrderIdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 10, maxLength: 1000 }
+                evidence:
+                  type: array
+                  maxItems: 10
+                  items: { $ref: '#/components/schemas/Evidence' }
+            example:
+              reason: The sandals arrived with a broken strap
+              evidence:
+                - { type: text, value: Strap came off on first use }
+                - { type: image, value: 'https://images.example.com/strap.jpg' }
+      responses:
+        '201':
+          description: Dispute opened
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisputeResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: DISPUTE_ALREADY_OPEN, or INVALID_STATE_TRANSITION (e.g. not shipped yet)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: DISPUTE_ALREADY_OPEN, message: There is already an open dispute for this sub-order, details: null }
+
+  /api/v1/disputes:
+    get:
+      summary: List disputes (ADMIN), newest first
+      tags: [Disputes]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [OPEN, RESOLVED] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of disputes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Dispute' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/disputes/{disputeId}:
+    get:
+      summary: One dispute (ADMIN, the buyer, or the vendor of that sub-order)
+      tags: [Disputes]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/DisputeIdPath' }
+      responses:
+        '200':
+          description: The dispute
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisputeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/disputes/{disputeId}/resolve:
+    patch:
+      summary: Resolve a dispute (ADMIN) and settle its escrow
+      description: |
+        One transaction, one balanced ledger transaction (reference `DISPUTE_RESOLUTION:<disputeId>`,
+        unique, so a dispute can never be resolved twice):
+
+        - **FULL_REFUND**: escrow -> buyer (whole subtotal). Sub-order REFUNDED.
+        - **PARTIAL_REFUND**: escrow -> buyer `refundKobo` (0 < refundKobo < subtotal); the vendor gets
+          the rest minus commission, and commission is charged on the vendor's part only.
+          Example: subtotal 100000, refund 40000, 500 bps -> buyer 40000, vendor 57000, revenue 3000.
+          Sub-order COMPLETED.
+        - **REJECTED**: normal release (vendor 95%, revenue 5% at 500 bps). Sub-order COMPLETED.
+      tags: [Disputes]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/DisputeIdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [resolution, note]
+              properties:
+                resolution: { type: string, enum: [FULL_REFUND, PARTIAL_REFUND, REJECTED] }
+                refundKobo: { type: integer, minimum: 1, description: Required for PARTIAL_REFUND only }
+                note: { type: string, minLength: 5, maxLength: 1000 }
+            examples:
+              full: { value: { resolution: FULL_REFUND, note: Item damaged in transit } }
+              partial: { value: { resolution: PARTIAL_REFUND, refundKobo: 40000, note: One strap broken } }
+              rejected: { value: { resolution: REJECTED, note: Photos show normal wear } }
+      responses:
+        '200':
+          description: Resolved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DisputeResponse' }
+        '400':
+          description: VALIDATION_ERROR or INVALID_REFUND_AMOUNT
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: DISPUTE_ALREADY_RESOLVED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/payouts:
+    post:
+      summary: Request a payout to your bank account (VENDOR)
+      description: |
+        Requires an APPROVED vendor profile with bank details. The amount leaves your wallet
+        immediately (into payout clearing), so it can't be spent or withdrawn twice. At most one
+        PENDING/PROCESSING payout per vendor. Requires an `Idempotency-Key`.
+      tags: [Payouts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [amountKobo]
+              properties:
+                amountKobo: { type: integer, minimum: 100000, description: 'At least PAYOUT_MIN_KOBO (NGN 1,000)' }
+            example:
+              amountKobo: 300000
+      responses:
+        '201':
+          description: Payout requested (PENDING)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Balance too low
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: FORBIDDEN (not a vendor), VENDOR_NOT_APPROVED or ACCOUNT_FROZEN
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '409':
+          description: PAYOUT_ALREADY_PENDING, IDEMPOTENCY_KEY_REUSED or REQUEST_IN_PROGRESS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                error: { code: PAYOUT_ALREADY_PENDING, message: You already have a payout in progress, details: null }
+    get:
+      summary: Your payouts (VENDOR), newest first
+      tags: [Payouts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING, PROCESSING, SUCCESS, FAILED] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of payouts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Payout' }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/payouts/{payoutId}:
+    get:
+      summary: One payout (the owning vendor or ADMIN)
+      tags: [Payouts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/PayoutIdPath' }
+      responses:
+        '200':
+          description: The payout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /api/v1/webhooks/paystack:
     post:
       summary: Paystack webhook receiver (called by Paystack, not by apps)
@@ -1221,7 +1469,8 @@ paths:
         body, keyed with the Paystack secret key. Every request is recorded in webhook_events.
         For `charge.success` the payment is re-verified with Paystack (status, currency, amount)
         before the wallet is credited, and it is credited exactly once however many times the
-        event is delivered. Every validly signed event gets 200 so Paystack stops retrying.
+        event is delivered. `transfer.success` / `transfer.failed` / `transfer.reversed` (vendor
+        payouts, reference = payout id) are re-verified too, then settle or reverse the payout once. Every validly signed event gets 200 so Paystack stops retrying.
         A 500 (e.g. Paystack unreachable during verification) makes Paystack retry later.
         Not behind the API rate limiter.
       tags: [Webhooks]
@@ -1412,6 +1661,16 @@ components:
     SubOrderIdPath:
       in: path
       name: subOrderId
+      required: true
+      schema: { type: string, format: uuid }
+    DisputeIdPath:
+      in: path
+      name: disputeId
+      required: true
+      schema: { type: string, format: uuid }
+    PayoutIdPath:
+      in: path
+      name: payoutId
       required: true
       schema: { type: string, format: uuid }
     IdempotencyKey:
@@ -1856,6 +2115,71 @@ components:
           type: object
           properties:
             order: { $ref: '#/components/schemas/Order' }
+
+    Evidence:
+      type: object
+      required: [type, value]
+      properties:
+        type: { type: string, enum: [text, image] }
+        value: { type: string, description: 'Text, or an http(s) image URL' }
+
+    Dispute:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        subOrderId: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        buyerId: { type: string }
+        vendorId: { type: string }
+        subtotalKobo: { type: integer, example: 100000 }
+        reason: { type: string }
+        evidence: { type: array, items: { $ref: '#/components/schemas/Evidence' } }
+        status: { type: string, enum: [OPEN, RESOLVED] }
+        resolution: { type: string, nullable: true, enum: [FULL_REFUND, PARTIAL_REFUND, REJECTED] }
+        refundKobo: { type: integer, nullable: true, example: 40000 }
+        resolvedBy: { type: string, nullable: true, description: Admin user id }
+        resolutionNote: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+
+    DisputeResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            dispute: { $ref: '#/components/schemas/Dispute' }
+
+    Payout:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        vendorId: { type: string }
+        amountKobo: { type: integer, example: 300000 }
+        status: { type: string, enum: [PENDING, PROCESSING, SUCCESS, FAILED] }
+        bankSnapshot:
+          type: object
+          description: Bank details at request time (account number masked)
+          properties:
+            bankName: { type: string }
+            bankCode: { type: string }
+            accountName: { type: string }
+            accountNumber: { type: string, example: '******6789' }
+        attempts: { type: integer }
+        providerReference: { type: string, nullable: true }
+        failureReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        processedAt: { type: string, format: date-time, nullable: true }
+
+    PayoutResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            payout: { $ref: '#/components/schemas/Payout' }
 
     PaystackEvent:
       type: object

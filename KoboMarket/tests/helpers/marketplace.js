@@ -8,8 +8,9 @@ const bearer = (token) => ({ Authorization: `Bearer ${token}` });
 
 let storeCounter = 0;
 
-function bankDetails() {
-  return { bankName: 'Test Bank', bankCode: '058', accountNumber: '0123456789', accountName: 'Ada Obi' };
+// accountNumber ending in 0000 = the mock provider's "transfer fails" account.
+function bankDetails(accountNumber = '0123456789') {
+  return { bankName: 'Test Bank', bankCode: '058', accountNumber, accountName: 'Ada Obi' };
 }
 
 // A logged-in admin. (Roles are read from Mongo on each request, so promoting
@@ -21,13 +22,13 @@ async function createAdmin() {
 }
 
 // A logged-in vendor whose application was approved through the real endpoints.
-async function createApprovedVendor(admin) {
+async function createApprovedVendor(admin, { accountNumber } = {}) {
   const vendor = await registerAndLogin();
   storeCounter += 1;
   const applied = await request(app)
     .post('/api/v1/vendors/apply')
     .set(bearer(vendor.accessToken))
-    .send({ storeName: `Store ${Date.now()} ${storeCounter}`, bankDetails: bankDetails() })
+    .send({ storeName: `Store ${Date.now()} ${storeCounter}`, bankDetails: bankDetails(accountNumber) })
     .expect(201);
   await request(app)
     .patch(`/api/v1/admin/vendors/${applied.body.data.application.id}/approve`)

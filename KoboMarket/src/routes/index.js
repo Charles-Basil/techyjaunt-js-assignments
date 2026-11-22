@@ -15,6 +15,8 @@ router.use('/cart', require('../modules/cart/cart.routes'));
 router.use('/wallet', require('../modules/wallet/wallet.routes'));
 router.use('/orders', require('../modules/orders/orders.routes'));
 router.use('/sub-orders', require('../modules/orders/subOrders.routes'));
+router.use('/disputes', require('../modules/disputes/disputes.routes'));
+router.use('/payouts', require('../modules/payouts/payouts.routes'));
 router.use('/admin', require('../modules/admin/admin.routes'));
 router.use('/vendor', require('../modules/vendors/vendorArea.routes')); // the logged-in vendor's area
 

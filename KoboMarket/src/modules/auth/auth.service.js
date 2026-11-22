@@ -13,7 +13,7 @@ const refreshTokenRepository = require('./refreshToken.repository');
 const walletService = require('../wallet/wallet.service');
 const mailer = require('../notifications/mailer.service');
 
-const BCRYPT_COST = 12;
+const BCRYPT_COST = env.BCRYPT_COST; // 12 by default; tests use 4 (see .env.test)
 const EMAIL_VERIFY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000; // 30 minutes
 

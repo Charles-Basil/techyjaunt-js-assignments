@@ -15,7 +15,9 @@
     "migrate:rollback": "knex migrate:rollback",
     "seed": "knex seed:run",
     "test": "jest --runInBand",
-    "audit:ledger": "node scripts/audit-ledger.js"
+    "posttest": "node scripts/audit-test-db.js",
+    "audit:ledger": "node scripts/audit-ledger.js",
+    "job": "node scripts/run-job.js"
   },
   "jest": {
     "testEnvironment": "node",
