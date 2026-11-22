@@ -55,6 +55,20 @@ function resetPasswordByTokenHash(tokenHash, now, passwordHash) {
   );
 }
 
+function setStatus(id, status) {
+  return User.findByIdAndUpdate(id, { $set: { status } }, { returnDocument: 'after' });
+}
+
+// Admin user list (filters already validated and regex-escaped by the service).
+function listForAdmin(filter, sort, limit) {
+  return User.find(filter).sort(sort).limit(limit);
+}
+
+async function findAdminIds() {
+  const admins = await User.find({ roles: 'ADMIN' }).select('_id').lean();
+  return admins.map((a) => String(a._id));
+}
+
 // $addToSet adds the role only if the user doesn't already have it.
 function addRole(id, role) {
   return User.updateOne({ _id: id }, { $addToSet: { roles: role } });
@@ -81,6 +95,9 @@ module.exports = {
   verifyEmailByTokenHash,
   setPasswordResetToken,
   resetPasswordByTokenHash,
+  findAdminIds,
+  setStatus,
+  listForAdmin,
   addRole,
   markWalletCreated,
   findPendingWallets,

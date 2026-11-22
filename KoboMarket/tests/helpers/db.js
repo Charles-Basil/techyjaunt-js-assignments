@@ -10,8 +10,19 @@ const { Review } = require('../../src/modules/reviews/review.model');
 const { Cart } = require('../../src/modules/cart/cart.model');
 const MockPaystackTransaction = require('../../src/mock-paystack/MockPaystackTransaction');
 const MockPaystackTransfer = require('../../src/mock-paystack/MockPaystackTransfer');
+const { Notification } = require('../../src/modules/notifications/notification.model');
 
-const MODELS = [User, RefreshToken, VendorProfile, Product, Review, Cart, MockPaystackTransaction, MockPaystackTransfer];
+const MODELS = [
+  User,
+  RefreshToken,
+  VendorProfile,
+  Product,
+  Review,
+  Cart,
+  MockPaystackTransaction,
+  MockPaystackTransfer,
+  Notification,
+];
 
 async function connect() {
   await mongoose.connect(env.MONGO_URI, {
@@ -40,7 +51,7 @@ async function clean() {
   await knex.raw(`
     TRUNCATE TABLE ledger_entries, transactions, wallet_fundings, webhook_events,
                    idempotency_keys, payouts, disputes, order_items, sub_orders,
-                   orders, outbox
+                   orders, outbox, admin_audit_log
     CASCADE
   `);
   await knex('accounts').update({ balance_kobo: '0', status: 'ACTIVE' });

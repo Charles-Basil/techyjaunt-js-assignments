@@ -46,6 +46,10 @@ tags:
       Vendors withdraw wallet money to their bank. The amount leaves the wallet immediately
       (into payout clearing); a background job sends the transfer. If the transfer fails,
       the money goes back to the wallet.
+  - name: Notifications
+  - name: Admin
+  - name: Reports
+    description: ADMIN only. Money as whole kobo; calendar days are Africa/Lagos days.
   - name: Webhooks
   - name: Mock Paystack
     description: Fake payment provider. Only available when PAYSTACK_MODE=mock and NODE_ENV is not production.
@@ -1461,6 +1465,459 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /api/v1/notifications:
+    get:
+      summary: Your notifications, newest first (cursor paginated)
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: unread, schema: { type: string, enum: ['true', 'false'] }, description: 'true = unread only' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of notifications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/unread-count:
+    get:
+      summary: How many unread notifications you have
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: object, properties: { unread: { type: integer, example: 3 } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/read-all:
+    patch:
+      summary: Mark all your notifications as read
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: How many were marked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: object, properties: { modified: { type: integer, example: 3 } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/notifications/{notificationId}/read:
+    patch:
+      summary: Mark one of your notifications as read
+      description: Another user's notification id returns 404.
+      tags: [Notifications]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: notificationId, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The notification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: object, properties: { notification: { $ref: '#/components/schemas/Notification' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/users:
+    get:
+      summary: Find users (ADMIN)
+      description: '`q` searches email, first and last name, case-insensitive. Regex characters are matched literally.'
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: q, schema: { type: string, maxLength: 100 } }
+        - { in: query, name: role, schema: { type: string, enum: [BUYER, VENDOR, ADMIN] } }
+        - { in: query, name: status, schema: { type: string, enum: [ACTIVE, FROZEN] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: array, items: { $ref: '#/components/schemas/User' } }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/users/{userId}/freeze:
+    patch:
+      summary: Freeze or unfreeze a user (ADMIN)
+      description: |
+        Sets the user's status in MongoDB AND their wallet accounts' status in Postgres (if the
+        Postgres step fails, MongoDB is reverted and 500 is returned). Freezing also revokes all
+        refresh tokens. A frozen user can't log in, check out, fund or request payouts.
+        Written to the admin audit log. You can't freeze yourself.
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: userId, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [frozen, reason]
+              properties:
+                frozen: { type: boolean }
+                reason: { type: string, minLength: 3, maxLength: 500 }
+            example: { frozen: true, reason: Chargeback investigation }
+      responses:
+        '200':
+          description: The updated user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserResponse' }
+        '400':
+          description: VALIDATION_ERROR or CANNOT_FREEZE_SELF
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: FREEZE_FAILED (nothing was changed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/v1/admin/wallets/{accountId}/ledger:
+    get:
+      summary: An account and its full ledger history (ADMIN)
+      description: Each entry includes the other side(s) of its transaction (`counterEntries`).
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: path, name: accountId, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Account + one page of entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      account:
+                        type: object
+                        properties:
+                          id: { type: string, format: uuid }
+                          ownerType: { type: string, enum: [USER, SYSTEM] }
+                          ownerId: { type: string }
+                          code: { type: string, nullable: true }
+                          owner: { type: object, nullable: true, properties: { id: { type: string }, email: { type: string }, name: { type: string } } }
+                          currency: { type: string }
+                          balanceKobo: { type: integer }
+                          status: { type: string, enum: [ACTIVE, FROZEN] }
+                      entries:
+                        type: array
+                        items:
+                          allOf:
+                            - { $ref: '#/components/schemas/WalletEntry' }
+                            - type: object
+                              properties:
+                                counterEntries: { type: array, items: { $ref: '#/components/schemas/LedgerSide' } }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/transactions:
+    get:
+      summary: All ledger transactions with their entries (ADMIN)
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: type, schema: { type: string, example: ORDER_PAYMENT } }
+        - { in: query, name: from, schema: { type: string, format: date }, description: Lagos calendar day (inclusive) }
+        - { in: query, name: to, schema: { type: string, format: date }, description: Lagos calendar day (inclusive) }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        reference: { type: string }
+                        type: { type: string }
+                        status: { type: string }
+                        metadata: { type: object }
+                        createdAt: { type: string, format: date-time }
+                        entries: { type: array, items: { $ref: '#/components/schemas/LedgerSide' } }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/settings/commission:
+    patch:
+      summary: Change the commission rate for NEW checkouts (ADMIN)
+      description: Existing sub-orders keep the rate stored at their checkout. Written to the admin audit log.
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [commissionRateBps]
+              properties:
+                commissionRateBps: { type: integer, minimum: 0, maximum: 5000, description: 500 = 5% }
+            example: { commissionRateBps: 750 }
+      responses:
+        '200':
+          description: New and previous rate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: object, properties: { commissionRateBps: { type: integer, example: 750 }, previousCommissionRateBps: { type: integer, example: 500 } } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/audit-log:
+    get:
+      summary: Admin decisions, newest first (ADMIN)
+      description: Vendor approve/reject, freeze/unfreeze, commission changes and dispute resolutions. Append-only.
+      tags: [Admin]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: One page of audit log rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data: { type: array, items: { $ref: '#/components/schemas/AuditLogEntry' } }
+                  pagination: { $ref: '#/components/schemas/Pagination' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/reports/revenue:
+    get:
+      summary: Platform revenue per day (ADMIN)
+      description: Credits minus debits on PLATFORM_REVENUE per Lagos day; days with no revenue are 0. At most 366 days.
+      tags: [Reports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: from, required: true, schema: { type: string, format: date }, example: '2026-11-01' }
+        - { in: query, name: to, required: true, schema: { type: string, format: date }, example: '2026-11-07' }
+      responses:
+        '200':
+          description: Revenue report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      from: { type: string, format: date }
+                      to: { type: string, format: date }
+                      totalKobo: { type: integer }
+                      days: { type: array, items: { type: object, properties: { date: { type: string, format: date }, revenueKobo: { type: integer } } } }
+              example:
+                success: true
+                data:
+                  from: '2026-11-20'
+                  to: '2026-11-22'
+                  totalKobo: 15000
+                  days:
+                    - { date: '2026-11-20', revenueKobo: 0 }
+                    - { date: '2026-11-21', revenueKobo: 5000 }
+                    - { date: '2026-11-22', revenueKobo: 10000 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/reports/top-vendors:
+    get:
+      summary: Top 10 vendors by completed sales in a month (ADMIN)
+      description: netKobo = what the vendor was paid = grossKobo - commissionKobo - refundedKobo (partial dispute refunds).
+      tags: [Reports]
+      security:
+        - bearerAuth: []
+      parameters:
+        - { in: query, name: month, schema: { type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$' }, description: 'YYYY-MM, default: the current month in Lagos', example: '2026-11' }
+      responses:
+        '200':
+          description: Top vendors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      month: { type: string, example: '2026-11' }
+                      vendors:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            rank: { type: integer }
+                            vendorId: { type: string }
+                            storeName: { type: string, nullable: true }
+                            completedCount: { type: integer }
+                            grossKobo: { type: integer }
+                            commissionKobo: { type: integer }
+                            refundedKobo: { type: integer }
+                            netKobo: { type: integer }
+              example:
+                success: true
+                data:
+                  month: '2026-11'
+                  vendors:
+                    - { rank: 1, vendorId: 674a1e992b9e4c0012ab34aa, storeName: Lagos Gadget Hub, completedCount: 2, grossKobo: 200000, commissionKobo: 10000, refundedKobo: 0, netKobo: 190000 }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/reports/escrow:
+    get:
+      summary: Escrow balance vs open sub-orders (ADMIN)
+      tags: [Reports]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Escrow report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      escrowBalanceKobo: { type: integer }
+                      openSubOrdersTotalKobo: { type: integer }
+                      matches: { type: boolean, description: Should always be true }
+                      breakdown: { type: array, items: { type: object, properties: { status: { type: string }, count: { type: integer }, totalKobo: { type: integer } } } }
+              example:
+                success: true
+                data:
+                  escrowBalanceKobo: 400000
+                  openSubOrdersTotalKobo: 400000
+                  matches: true
+                  breakdown:
+                    - { status: PAID, count: 2, totalKobo: 300000 }
+                    - { status: SHIPPED, count: 1, totalKobo: 100000 }
+                    - { status: DELIVERED, count: 0, totalKobo: 0 }
+                    - { status: DISPUTED, count: 0, totalKobo: 0 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/reports/reconciliation:
+    get:
+      summary: Accounts whose cached balance differs from their ledger entries (ADMIN)
+      description: Should always be empty. Uses the same SQL as the ledger audit.
+      tags: [Reports]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Reconciliation report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  data:
+                    type: object
+                    properties:
+                      ok: { type: boolean }
+                      mismatches:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            accountId: { type: string, format: uuid }
+                            ownerType: { type: string }
+                            ownerId: { type: string }
+                            code: { type: string, nullable: true }
+                            storedBalanceKobo: { type: integer }
+                            ledgerBalanceKobo: { type: integer }
+                            differenceKobo: { type: integer }
+              example:
+                success: true
+                data: { ok: true, mismatches: [] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /api/v1/webhooks/paystack:
     post:
       summary: Paystack webhook receiver (called by Paystack, not by apps)
@@ -2180,6 +2637,41 @@ components:
           type: object
           properties:
             payout: { $ref: '#/components/schemas/Payout' }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        type: { type: string, enum: [ORDER_PLACED, ORDER_SHIPPED, FUNDS_RELEASED, DISPUTE_OPENED, DISPUTE_RESOLVED, PAYOUT_SUCCESS, PAYOUT_FAILED] }
+        title: { type: string, example: Payment released }
+        message: { type: string, example: 'NGN 950.00 has been added to your wallet.' }
+        data: { type: object, description: 'orderId, subOrderId, payoutId, amountKobo...' }
+        readAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    LedgerSide:
+      type: object
+      properties:
+        accountId: { type: string, format: uuid }
+        accountCode: { type: string, nullable: true, example: PLATFORM_ESCROW }
+        ownerType: { type: string, enum: [USER, SYSTEM] }
+        ownerId: { type: string }
+        direction: { type: string, enum: [DEBIT, CREDIT] }
+        amountKobo: { type: integer }
+
+    AuditLogEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        adminId: { type: string }
+        action: { type: string, example: USER_FROZEN }
+        targetType: { type: string, enum: [VENDOR_APPLICATION, USER, SETTING, DISPUTE] }
+        targetId: { type: string }
+        before: { type: object, nullable: true }
+        after: { type: object, nullable: true }
+        note: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
 
     PaystackEvent:
       type: object

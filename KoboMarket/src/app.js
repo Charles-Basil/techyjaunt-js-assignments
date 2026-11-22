@@ -18,6 +18,10 @@ const AppError = require('./utils/AppError');
 const healthRouter = require('./routes/health');
 const apiRouter = require('./routes');
 const webhookRouter = require('./modules/wallet/webhook.routes');
+const { registerNotificationListeners } = require('./events/listeners/notification.listener');
+
+// Subscribe event listeners once (the server and the tests both build the app here).
+registerNotificationListeners();
 
 const app = express();
 

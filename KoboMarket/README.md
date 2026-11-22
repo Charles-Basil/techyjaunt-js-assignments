@@ -24,6 +24,12 @@ Then open:
 
 When the `api` container starts, it runs all migrations before the server starts.
 
+Load demo data (admin, 3 vendors, 20 products, 5 funded buyers; see "Seed data"):
+
+```powershell
+docker compose exec api npm run seed -- --reset
+```
+
 ### Running the API outside Docker (optional)
 
 Start only the databases in Docker, then run the API with nodemon:
@@ -470,6 +476,131 @@ payouts job (every minute, PAYOUT_JOB_CRON):        │  claim -> PROCESSING -> 
 `npm test` ends with `posttest` (`scripts/audit-test-db.js`): the ledger audit on the
 test database. If the books don't balance, `npm test` fails.
 
+## Notifications
+
+In-app notifications (MongoDB `notifications`), created from domain events:
+
+| Event | Who gets a notification |
+| --- | --- |
+| `order.placed` | the buyer + each vendor in the order |
+| `order.shipped` | the buyer |
+| `funds.released` | the vendor |
+| `dispute.opened` | the vendor + every ADMIN |
+| `dispute.resolved` | the buyer + the vendor |
+| `payout.success` / `payout.failed` | the vendor |
+
+- `src/events/listeners/notification.listener.js` subscribes once, when `app.js` loads.
+  Each handler runs on a **later tick** (`setImmediate`), after the HTTP response has
+  been sent. It catches and logs its own errors and is never awaited, so a broken
+  notification can never break a checkout (there is a test that makes the listener throw).
+- **No duplicates:** every notification has a `dedupeKey` (e.g. `ORDER_PLACED:<orderId>`),
+  unique per user, and is written with an upsert. The same event handled twice creates
+  one notification.
+- Endpoints (your own notifications only): `GET /notifications` (cursor, `?unread=true`),
+  `GET /notifications/unread-count`, `PATCH /notifications/:id/read` (someone else's id
+  returns 404), `PATCH /notifications/read-all` (returns how many changed).
+
+**Why an in-process `EventEmitter`, and its limit.** It's the simplest thing that works:
+no broker to run, and events are emitted only **after** the database transaction
+commits, so a listener never sees something that was rolled back. The limit: if the
+process crashes between the commit and the listener running, that notification is
+**lost** (the money is safe; only the message is missing). An **outbox** would fix
+that: write the event into the `outbox` table *inside the same transaction* as the
+money change, and let a worker read unsent rows, deliver them, and mark them sent.
+Then an event exists if and only if the change committed, and a crash only delays it
+(the worker retries; the dedupe key makes retries harmless). The `outbox` table
+already exists for that next step.
+
+## Admin and reports
+
+Every route under `/api/v1/admin` requires ADMIN through one router-level
+`requireRole('ADMIN')` (a test calls all of them as a buyer and expects 403).
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /admin/users?q=&role=&status=` | Search users (email or name, case-insensitive; regex characters are escaped) |
+| `PATCH /admin/users/:id/freeze` `{ frozen, reason }` | Freeze/unfreeze in **both** databases (below) |
+| `GET /admin/wallets/:accountId/ledger` | One account + its full history, each entry with its counter-entries |
+| `GET /admin/transactions?type=&from=&to=` | Every ledger transaction with its entries |
+| `PATCH /admin/settings/commission` `{ commissionRateBps }` | 0 to 5000. Only NEW checkouts use it |
+| `GET /admin/audit-log` | Append-only log of admin decisions |
+| `GET /admin/reports/...` | Reports (below) |
+
+**Freezing a user** sets `users.status` in MongoDB first, then `accounts.status` in
+Postgres plus an audit-log row (in one Postgres transaction). If Postgres fails, the
+MongoDB change is reverted and the API answers 500, so the two databases never
+disagree. Freezing also revokes every refresh token. A frozen user is stopped three
+ways: login refuses them, `notFrozen` blocks checkout, funding and payouts, and the
+ledger refuses to move money on a FROZEN account. An admin can't freeze themselves.
+
+**Audit log** (`admin_audit_log`, append-only trigger): vendor approve/reject,
+freeze/unfreeze, commission change and dispute resolution, each with
+before/after/note. Dispute, freeze and commission rows are written in the **same
+transaction** as the change. Vendor decisions live in MongoDB, so their row is
+written right after (a failure there is logged, not hidden).
+
+**Reports**: raw SQL with bound parameters, all aggregation in Postgres, days in
+`Africa/Lagos`:
+
+```jsonc
+// GET /admin/reports/revenue?from=2026-11-20&to=2026-11-22
+// credits - debits on PLATFORM_REVENUE per Lagos day; generate_series fills empty days with 0
+{ "from": "2026-11-20", "to": "2026-11-22", "totalKobo": 15000,
+  "days": [ { "date": "2026-11-20", "revenueKobo": 0 },
+            { "date": "2026-11-21", "revenueKobo": 5000 },
+            { "date": "2026-11-22", "revenueKobo": 10000 } ] }
+
+// GET /admin/reports/top-vendors?month=2026-11   (default: this month in Lagos)
+// COMPLETED sub-orders in the month; store names from MongoDB in ONE $in query
+{ "month": "2026-11",
+  "vendors": [ { "rank": 1, "storeName": "Lagos Gadget Hub", "completedCount": 2,
+                 "grossKobo": 200000, "commissionKobo": 10000, "refundedKobo": 0, "netKobo": 190000 } ] }
+
+// GET /admin/reports/escrow
+{ "escrowBalanceKobo": 400000, "openSubOrdersTotalKobo": 400000, "matches": true,
+  "breakdown": [ { "status": "PAID", "count": 2, "totalKobo": 300000 },
+                 { "status": "SHIPPED", "count": 1, "totalKobo": 100000 },
+                 { "status": "DELIVERED", "count": 0, "totalKobo": 0 },
+                 { "status": "DISPUTED", "count": 0, "totalKobo": 0 } ] }
+
+// GET /admin/reports/reconciliation   (same SQL as the ledger audit; should always be empty)
+{ "ok": true, "mismatches": [] }
+```
+
+`netKobo` = what the vendor was actually paid = gross - commission - partial refunds.
+The escrow report's `matches` should always be true: every kobo in escrow belongs to
+exactly one open (PAID / SHIPPED / DELIVERED / DISPUTED) sub-order.
+
+## Seed data
+
+```powershell
+npm run seed                                     # from your machine (.env, localhost ports)
+docker compose exec api npm run seed             # inside Docker
+docker compose exec api npm run seed -- --reset  # wipe dev data first, for a clean demo
+```
+
+- Refuses to run when `NODE_ENV=production`.
+- **Idempotent:** if `admin@kobomarket.test` exists, it prints "already seeded" and
+  exits 0. `--reset` wipes the MongoDB collections and the Postgres data
+  (`TRUNCATE ... CASCADE`; the migrations table is kept), re-creates the system
+  accounts and settings, then seeds.
+- Buyers are funded with a real `WALLET_FUNDING` ledger transaction (DEBIT external,
+  CREDIT wallet). The seed ends by printing a table of accounts and running the ledger audit.
+
+**Every account's password: `Password123`** (all emails already verified)
+
+| Email | Role | Notes |
+| --- | --- | --- |
+| admin@kobomarket.test | ADMIN | |
+| vendor1@kobomarket.test | VENDOR | Lagos Gadget Hub (electronics, home) |
+| vendor2@kobomarket.test | VENDOR | Ankara & Aso Couture (fashion, beauty) |
+| vendor3@kobomarket.test | VENDOR | Naija Pantry (groceries, home, beauty). Bank account ends in **0000**, so payouts FAIL (demo) |
+| buyer1..5@kobomarket.test | BUYER | NGN 50,000 in the wallet each |
+
+20 products across electronics, fashion, home, beauty and groceries. Four have
+variants with their own price and stock (phone colours, dress sizes,
+shirt size/colour, slipper size/colour).
+
 ## Cross-database consistency: user -> wallet
 
 Users live in **MongoDB** and wallets (the `accounts` table) live in **PostgreSQL**.
@@ -504,7 +635,7 @@ duplicate or missing wallet.
 | `npm start`                | Start with node                               |
 | `npm run migrate`          | Run all pending Postgres migrations           |
 | `npm run migrate:rollback` | Undo the last batch of migrations             |
-| `npm run seed`             | Run seed files (placeholder for now)          |
+| `npm run seed`             | Demo data (`-- --reset` wipes dev data first) |
 | `npm test`                 | Run Jest tests, then the ledger audit on the test DB |
 | `npm run audit:ledger`     | Ledger consistency audit (exit code 1 on FAIL) |
 | `npm run job -- <name>`    | Run one background job once: `payouts`, `auto-complete`, `stock-recovery`, `wallet-reconciler` |
@@ -525,7 +656,8 @@ src/
   ledger/             ledger.service.js (the only code that moves money), audit.js
   integrations/       paystack.client.js (mock or live provider)
   mock-paystack/      Fake Paystack: provider, checkout routes, signed webhook sender
-  events/             emitter.js: in-process domain events (order.placed, funds.released, ...)
+  events/             emitter.js (in-process domain events) + listeners/ (notifications)
+  seed/               demo data and the seed logic (used by npm run seed and tests)
 db/migrations/        Knex migrations (Postgres)
 db/seeds/             Knex seeds
 docs/openapi.yaml     API documentation served at /api-docs

@@ -34,8 +34,14 @@ function decide(id, { status, rejectionReason, reviewedBy }) {
   );
 }
 
+// Many vendors' profiles in ONE query (reports).
+function findByUserIds(userIds) {
+  if (userIds.length === 0) return [];
+  return VendorProfile.find({ userId: { $in: userIds } }).select('userId storeName storeSlug').lean();
+}
+
 function list(filter, sort, limit) {
   return VendorProfile.find(filter).sort(sort).limit(limit);
 }
 
-module.exports = { create, findById, findByUserId, reapply, decide, list };
+module.exports = { create, findById, findByUserId, findByUserIds, reapply, decide, list };

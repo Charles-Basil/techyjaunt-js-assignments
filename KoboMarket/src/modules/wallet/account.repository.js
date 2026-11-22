@@ -49,4 +49,24 @@ function listEntries(accountId, { after, limit }) {
     );
 }
 
-module.exports = { insertUserAccountIfMissing, findUserAccount, listEntries };
+function findById(id) {
+  return knex('accounts').where({ id }).first();
+}
+
+// Freeze / unfreeze every Postgres account a user owns (inside the caller's transaction).
+function setOwnerStatus(trx, userId, status) {
+  return trx('accounts').where({ owner_type: 'USER', owner_id: String(userId) }).update({ status });
+}
+
+// For each transaction id: its entries on OTHER accounts (the "other side" of the money).
+function findCounterEntries(transactionIds, excludeAccountId) {
+  if (transactionIds.length === 0) return [];
+  return knex('ledger_entries as le')
+    .join('accounts as a', 'a.id', 'le.account_id')
+    .whereIn('le.transaction_id', transactionIds)
+    .whereNot('le.account_id', excludeAccountId)
+    .orderBy('le.id')
+    .select('le.transaction_id', 'le.account_id', 'a.code', 'a.owner_type', 'a.owner_id', 'le.direction', 'le.amount_kobo');
+}
+
+module.exports = { insertUserAccountIfMissing, findUserAccount, findById, setOwnerStatus, listEntries, findCounterEntries };

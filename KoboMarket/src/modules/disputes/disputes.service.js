@@ -16,6 +16,7 @@ const { transition, allowedFrom } = require('../orders/orderStateMachine');
 const { splitCommission } = require('../orders/commission');
 const { releaseInTransaction, emitReleased, escrowSettlementKey } = require('../orders/release.service');
 const disputeRepository = require('./dispute.repository');
+const adminAuditRepository = require('../admin/adminAudit.repository');
 
 function disputeDto(d) {
   return {
@@ -81,8 +82,15 @@ async function openDispute(user, subOrderId, { reason, evidence }) {
     return created;
   });
 
-  emitEvent('dispute.opened', { disputeId: dispute.id, subOrderId, buyerId: String(user._id) });
-  return disputeDto(await disputeRepository.findById(dispute.id));
+  const saved = await disputeRepository.findById(dispute.id);
+  emitEvent('dispute.opened', {
+    disputeId: dispute.id,
+    subOrderId,
+    orderId: saved.order_id,
+    buyerId: String(user._id),
+    vendorId: saved.vendor_id,
+  });
+  return disputeDto(saved);
 }
 
 // ---------- read ----------
@@ -202,6 +210,16 @@ async function resolveDispute(admin, disputeId, { resolution, refundKobo, note }
     }
 
     await disputeRepository.markResolved(trx, disputeId, { resolution, refundKobo: refunded, resolvedBy: adminId, note });
+    // Same transaction: the audit row exists if and only if the resolution happened.
+    await adminAuditRepository.record(trx, {
+      adminId,
+      action: 'DISPUTE_RESOLVED',
+      targetType: 'DISPUTE',
+      targetId: disputeId,
+      before: { status: 'OPEN', subOrderStatus: 'DISPUTED' },
+      after: { status: 'RESOLVED', resolution, refundKobo: refunded === null ? null : refunded.toString() },
+      note,
+    });
     return { released, refunded, subOrder };
   });
 
@@ -209,6 +227,8 @@ async function resolveDispute(admin, disputeId, { resolution, refundKobo, note }
   emitEvent('dispute.resolved', {
     disputeId,
     subOrderId: outcome.subOrder.id,
+    buyerId: outcome.subOrder.buyer_id,
+    vendorId: outcome.subOrder.vendor_id,
     resolution,
     refundKobo: outcome.refunded === null ? 0 : toKoboNumber(outcome.refunded),
   });

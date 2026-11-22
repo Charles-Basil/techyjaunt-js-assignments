@@ -3,6 +3,9 @@ const { slugify } = require('../../utils/slug');
 const pagination = require('../../utils/pagination');
 const vendorRepository = require('./vendor.repository');
 const userRepository = require('../users/user.repository');
+const adminAuditRepository = require('../admin/adminAudit.repository');
+const { knex } = require('../../config/knex');
+const logger = require('../../config/logger');
 
 // Turns a Mongo duplicate-key error (code 11000) into a friendly 409.
 function duplicateError(err) {
@@ -71,6 +74,20 @@ async function decide(applicationId, { decision, reason }, adminId) {
     // but the user lacks the role until it is added (e.g. by support).
     await userRepository.addRole(profile.userId, 'VENDOR');
   }
+
+  // The decision lives in MongoDB, the audit log in Postgres: they can't share a
+  // transaction. A failed log write is logged loudly but doesn't undo the decision.
+  await adminAuditRepository
+    .record(knex, {
+      adminId,
+      action: decision === 'APPROVED' ? 'VENDOR_APPROVED' : 'VENDOR_REJECTED',
+      targetType: 'VENDOR_APPLICATION',
+      targetId: applicationId,
+      before: { status: 'PENDING' },
+      after: { status: decision },
+      note: reason || null,
+    })
+    .catch((err) => logger.error({ err, applicationId }, 'Could not write admin audit log'));
   return profile;
 }
 

@@ -24,9 +24,11 @@ async function checkTransactionsBalanced(knex) {
   return { name: 'Every transaction is balanced (debits = credits)', pass: rows.length === 0, problems: rows };
 }
 
-async function checkAccountBalances(knex) {
-  // b) every account: stored balance = credits - debits of its entries
-  const { rows } = await knex.raw(`
+// Accounts whose cached balance_kobo differs from what their entries add up to.
+// Also used by the admin reconciliation report. Should always be empty.
+async function findAccountMismatches(knex, limit = MAX_LISTED) {
+  const { rows } = await knex.raw(
+    `
     SELECT a.id, a.owner_type, a.owner_id, a.code,
            a.balance_kobo AS stored_balance,
            ${CREDITS} - ${DEBITS} AS ledger_balance
@@ -34,8 +36,17 @@ async function checkAccountBalances(knex) {
     LEFT JOIN ledger_entries le ON le.account_id = a.id
     GROUP BY a.id
     HAVING a.balance_kobo <> ${CREDITS} - ${DEBITS}
-    LIMIT ${MAX_LISTED}
-  `);
+    ORDER BY a.id
+    LIMIT ?
+  `,
+    [limit]
+  );
+  return rows;
+}
+
+async function checkAccountBalances(knex) {
+  // b) every account: stored balance = credits - debits of its entries
+  const rows = await findAccountMismatches(knex);
   return { name: 'Every account balance matches its ledger entries', pass: rows.length === 0, problems: rows };
 }
 
@@ -82,4 +93,4 @@ async function runAudit(knex) {
   return { pass: checks.every((c) => c.pass), checks };
 }
 
-module.exports = { runAudit };
+module.exports = { runAudit, findAccountMismatches };
